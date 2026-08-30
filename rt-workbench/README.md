@@ -26,6 +26,19 @@
 
 ## 실행
 
+### 가장 쉬운 방법 — 파일 하나로 실행 (터미널 명령 불필요)
+
+| 환경 | 방법 |
+|---|---|
+| Windows | **`실행.bat` 더블클릭** (Python만 설치되어 있으면 됨) |
+| macOS/Linux | `./run_workbench.sh` 또는 `python3 run_workbench.py` |
+
+런처가 알아서 처리합니다: 필수 패키지 확인(없으면 설치 제안) → 샘플 필름 자동 생성(최초 1회)
+→ 빈 포트에 서버 기동 → **기본 브라우저 자동 오픈**. 종료는 창에서 Ctrl+C.
+(화면은 브라우저에 뜹니다 — Streamlit 기반 데스크톱 웹앱의 동작 방식입니다.)
+
+### 수동 실행
+
 ```bash
 cd rt-workbench
 pip install -r requirements.txt
