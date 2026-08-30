@@ -69,6 +69,22 @@ def ensure_samples() -> None:
     subprocess.check_call([sys.executable, str(ROOT / "scripts" / "generate_samples.py")])
 
 
+def suppress_streamlit_onboarding() -> None:
+    """Streamlit 최초 실행 시 'Welcome to Streamlit! Email:' 입력 대기를 건너뛴다.
+
+    이 프롬프트가 뜨면 엔터를 칠 때까지 서버가 시작되지 않아 '브라우저 연결 거부'로
+    보인다. credentials.toml을 미리 만들어 두면 묻지 않는다.
+    """
+    cfg_dir = Path.home() / ".streamlit"
+    cred = cfg_dir / "credentials.toml"
+    if not cred.exists():
+        try:
+            cfg_dir.mkdir(parents=True, exist_ok=True)
+            cred.write_text('[general]\nemail = ""\n', encoding="utf-8")
+        except OSError:
+            pass  # 실패해도 치명적이지 않음 — 프롬프트에서 엔터만 치면 됨
+
+
 def find_free_port(start: int = 8501, tries: int = 50) -> int:
     for port in range(start, start + tries):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -80,6 +96,7 @@ def find_free_port(start: int = 8501, tries: int = 50) -> int:
 def main() -> None:
     check_deps()
     ensure_samples()
+    suppress_streamlit_onboarding()
 
     port = find_free_port()
     print(f"\nRT 판독 워크벤치를 시작합니다 → http://localhost:{port}")
