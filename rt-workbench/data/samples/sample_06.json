@@ -1,0 +1,58 @@
+{
+  "film": "sample_06.png",
+  "seed": 106,
+  "image_size": [
+    1400,
+    520
+  ],
+  "mm_per_px": 0.2,
+  "marker": {
+    "p1": [
+      80.0,
+      467.0
+    ],
+    "p2": [
+      130.0,
+      467.0
+    ],
+    "length_mm": 10.0
+  },
+  "ground_truth": [
+    {
+      "defect_type": "slag_inclusion",
+      "bbox": [
+        720.7,
+        274.7,
+        749.5,
+        291.3
+      ]
+    },
+    {
+      "defect_type": "lack_of_fusion",
+      "bbox": [
+        470.9,
+        222.7,
+        566.5,
+        239.5
+      ]
+    },
+    {
+      "defect_type": "crack",
+      "bbox": [
+        921.4,
+        249.8,
+        1051.1,
+        263.4
+      ]
+    },
+    {
+      "defect_type": "porosity",
+      "bbox": [
+        1199.2,
+        241.6,
+        1214.0,
+        256.3
+      ]
+    }
+  ]
+}

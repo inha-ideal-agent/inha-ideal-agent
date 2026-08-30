@@ -1,0 +1,49 @@
+{
+  "film": "sample_04.png",
+  "seed": 104,
+  "image_size": [
+    1400,
+    520
+  ],
+  "mm_per_px": 0.2,
+  "marker": {
+    "p1": [
+      80.0,
+      467.0
+    ],
+    "p2": [
+      130.0,
+      467.0
+    ],
+    "length_mm": 10.0
+  },
+  "ground_truth": [
+    {
+      "defect_type": "lack_of_fusion",
+      "bbox": [
+        307.1,
+        281.3,
+        441.2,
+        301.3
+      ]
+    },
+    {
+      "defect_type": "porosity",
+      "bbox": [
+        1114.5,
+        231.8,
+        1129.3,
+        246.6
+      ]
+    },
+    {
+      "defect_type": "porosity",
+      "bbox": [
+        751.4,
+        247.1,
+        764.2,
+        260.0
+      ]
+    }
+  ]
+}

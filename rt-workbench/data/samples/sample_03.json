@@ -1,0 +1,40 @@
+{
+  "film": "sample_03.png",
+  "seed": 103,
+  "image_size": [
+    1400,
+    520
+  ],
+  "mm_per_px": 0.2,
+  "marker": {
+    "p1": [
+      80.0,
+      467.0
+    ],
+    "p2": [
+      130.0,
+      467.0
+    ],
+    "length_mm": 10.0
+  },
+  "ground_truth": [
+    {
+      "defect_type": "crack",
+      "bbox": [
+        1117.0,
+        272.2,
+        1203.7,
+        284.2
+      ]
+    },
+    {
+      "defect_type": "porosity",
+      "bbox": [
+        292.0,
+        272.5,
+        307.6,
+        288.0
+      ]
+    }
+  ]
+}

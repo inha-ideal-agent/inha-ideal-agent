@@ -1,0 +1,87 @@
+{
+  "meta": {
+    "name": "데모 기준표 — ISO 5817/10675 계열 구조 모사",
+    "version": "0.1-demo",
+    "disclaimer": "본 기준표의 수치는 ISO 5817 계열의 '구조'를 모사한 데모 값이며 실제 규격 원문이 아닙니다. 실제 건조 선체의 생산 검사 합부 기준은 선급 NDT 지침 확인 및 도메인 멘토링으로 확정한 뒤, 이 JSON 파일만 교체하면 됩니다(룰 엔진 코드는 데이터 주도 설계로 무변경).",
+    "quality_levels": ["B", "C", "D"],
+    "limit_formula": "limit_mm = min(coef_thickness × 모재두께 t, cap_mm); permitted=false이면 크기와 무관하게 허용 불가"
+  },
+  "rules": {
+    "porosity": {
+      "clause": "DEMO-2011",
+      "name_ko": "기공(단일)",
+      "dimension": "최대 치수 d",
+      "levels": {
+        "B": { "permitted": true, "coef_thickness": 0.2, "cap_mm": 3.0 },
+        "C": { "permitted": true, "coef_thickness": 0.25, "cap_mm": 4.0 },
+        "D": { "permitted": true, "coef_thickness": 0.3, "cap_mm": 5.0 }
+      }
+    },
+    "cluster_porosity": {
+      "clause": "DEMO-2013",
+      "name_ko": "군집 기공",
+      "dimension": "군집 포락 치수 dA",
+      "levels": {
+        "B": { "permitted": true, "coef_thickness": 0.15, "cap_mm": 2.5 },
+        "C": { "permitted": true, "coef_thickness": 0.2, "cap_mm": 3.5 },
+        "D": { "permitted": true, "coef_thickness": 0.25, "cap_mm": 4.5 }
+      }
+    },
+    "crack": {
+      "clause": "DEMO-100",
+      "name_ko": "균열",
+      "dimension": "길이 l",
+      "levels": {
+        "B": { "permitted": false },
+        "C": { "permitted": false },
+        "D": { "permitted": false }
+      }
+    },
+    "lack_of_fusion": {
+      "clause": "DEMO-401",
+      "name_ko": "융합불량",
+      "dimension": "길이 l",
+      "levels": {
+        "B": { "permitted": false },
+        "C": { "permitted": false },
+        "D": { "permitted": true, "coef_thickness": 0.25, "cap_mm": 25.0 }
+      }
+    },
+    "incomplete_penetration": {
+      "clause": "DEMO-402",
+      "name_ko": "용입부족",
+      "dimension": "길이 l",
+      "levels": {
+        "B": { "permitted": false },
+        "C": { "permitted": false },
+        "D": { "permitted": true, "coef_thickness": 0.2, "cap_mm": 25.0 }
+      }
+    },
+    "slag_inclusion": {
+      "clause": "DEMO-301",
+      "name_ko": "슬래그 개재물",
+      "dimension": "높이/폭 h",
+      "levels": {
+        "B": { "permitted": true, "coef_thickness": 0.2, "cap_mm": 2.0 },
+        "C": { "permitted": true, "coef_thickness": 0.3, "cap_mm": 3.0 },
+        "D": { "permitted": true, "coef_thickness": 0.4, "cap_mm": 4.0 }
+      }
+    },
+    "undercut": {
+      "clause": "DEMO-5011",
+      "name_ko": "언더컷",
+      "dimension": "깊이 h",
+      "levels": {
+        "B": { "permitted": true, "coef_thickness": 0.05, "cap_mm": 0.5 },
+        "C": { "permitted": true, "coef_thickness": 0.1, "cap_mm": 0.5 },
+        "D": { "permitted": true, "coef_thickness": 0.2, "cap_mm": 1.0 }
+      }
+    }
+  },
+  "default_rule": {
+    "clause": "DEMO-UNLISTED",
+    "name_ko": "기준표 미등재 유형",
+    "fail_safe": true,
+    "detail": "기준표에 등재되지 않은 결함 유형입니다. 안전 우선(fail-safe) 원칙에 따라 자동 합격 처리하지 않으며, 판독원의 수동 판정 및 기준표 보완이 필요합니다."
+  }
+}

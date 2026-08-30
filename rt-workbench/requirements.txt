@@ -1,0 +1,13 @@
+streamlit>=1.37
+streamlit-image-coordinates>=0.1.9
+opencv-python-headless>=4.9
+numpy>=1.26
+pillow>=10.0
+pandas>=2.0
+reportlab>=4.0
+anthropic>=0.34
+requests>=2.31
+pytest>=8.0
+
+# 선택(무거움): 실데이터 학습 후 YOLO 백엔드 활성화 시에만 설치
+# ultralytics>=8.2
