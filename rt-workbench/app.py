@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -99,6 +100,7 @@ _STATE_DEFAULTS: dict = {
     "wb_click_points": [],  # 진행 중 클릭 좌표 (원본 픽셀 기준)
     "wb_click_last_time": None,  # 직전 처리한 클릭 unix_time (재클릭/중복 방지)
     "wb_det_status": None,  # 탐지 백엔드 상태 캐시
+    "wb_started_at": None,  # 이미지 로드 시각 — 판독 소요시간 측정 (창출 효과 정량화)
 }
 
 
@@ -123,6 +125,7 @@ def reset_for_new_image() -> None:
     st.session_state["wb_click_points"] = []
     st.session_state["wb_record_id"] = ""
     st.session_state["wb_archived"] = False
+    st.session_state["wb_started_at"] = time.time()  # 판독 소요시간 측정 시작
     # 이전 필름의 소견서 본문이 새 검사 기록에 저장되지 않도록 여기서만 비운다
     # (invalidate_judgment는 같은 이미지 내 재판정 시 편집 보호를 위해 남긴다).
     st.session_state["wb_report_text"] = ""
@@ -180,6 +183,16 @@ def _draw_dashed_rect(
     _dashed_line((x1, y2), (x1, y1))
 
 
+def _min_conf() -> float:
+    """AI 후보 '표시' 최소 신뢰도 — 탐지 자체는 recall 우선으로 전부 수행하고,
+    화면 표시만 필터링한다(채택/기각/판독원 추가 후보는 항상 표시)."""
+    return float(st.session_state.get("wb_min_conf", 0.0))
+
+
+def _is_hidden_by_conf(c: DefectCandidate) -> bool:
+    return c.source == "ai" and c.status == "proposed" and c.confidence < _min_conf()
+
+
 def _candidate_color(c: DefectCandidate) -> tuple[int, int, int]:
     if c.source == "human":
         return COLOR_HUMAN
@@ -207,6 +220,8 @@ def build_overlay_rgb(
     # 후보 박스 + ID
     if show_candidates:
         for c in st.session_state["wb_candidates"]:
+            if _is_hidden_by_conf(c):
+                continue
             color = _candidate_color(c)
             x1, y1, x2, y2 = (int(round(v)) for v in c.bbox)
             if c.status == "rejected":
@@ -401,6 +416,11 @@ def assemble_record(report_text: str) -> InspectionRecord:
         report_source=source,
         image_name=st.session_state["wb_image_name"],
         image_size=(int(gray.shape[1]), int(gray.shape[0])),
+        elapsed_seconds=(
+            round(time.time() - st.session_state["wb_started_at"], 1)
+            if st.session_state.get("wb_started_at")
+            else None
+        ),
     )
 
 
@@ -600,13 +620,19 @@ def _render_click_controls(accepted: list[DefectCandidate]) -> str:
 def _render_image_and_clicks(gray: np.ndarray, mode: str) -> None:
     """보기 옵션 + 이미지 표시(클릭 컴포넌트) + 클릭 이벤트 처리."""
     with st.container():
-        c1, c2, c3 = st.columns([1, 2, 1])
+        c1, c2, c3, c4 = st.columns([1, 1.6, 1.6, 1])
         use_clahe = c1.toggle("CLAHE 대비 향상", value=True, key="wb_clahe_on")
         clip = c2.slider(
             "CLAHE clip_limit", min_value=1.0, max_value=8.0, value=3.0, step=0.5,
             key="wb_clahe_clip", disabled=not use_clahe,
         )
-        show_cands = c3.toggle("AI 후보 오버레이", value=True, key="wb_overlay_on")
+        c3.slider(
+            "AI 후보 표시 최소 신뢰도", min_value=0.0, max_value=0.9, value=0.0, step=0.05,
+            key="wb_min_conf",
+            help="화면 표시만 필터링합니다 — 탐지는 recall 우선으로 전부 수행되며, "
+                 "채택/기각/직접 추가 후보는 항상 표시됩니다.",
+        )
+        show_cands = c4.toggle("AI 후보 오버레이", value=True, key="wb_overlay_on")
 
     try:
         rgb = build_overlay_rgb(
@@ -636,11 +662,25 @@ def _render_candidate_table() -> None:
         return
 
     st.caption("오탐은 클릭 한 번 — [기각]. 유형은 selectbox로 바로 수정할 수 있습니다.")
+
+    # 표시 순서: 채택 → 제안(신뢰도 내림차순) → 기각. 신뢰도 필터는 제안 상태에만 적용.
+    order = {"accepted": 0, "proposed": 1, "rejected": 2}
+    visible = sorted(
+        (c for c in cands if not _is_hidden_by_conf(c)),
+        key=lambda c: (order.get(c.status, 1), -c.confidence),
+    )
+    hidden_n = len(cands) - len(visible)
+    if hidden_n:
+        st.caption(
+            f"🔎 신뢰도 필터로 제안 후보 {hidden_n}건 숨김 (슬라이더를 낮추면 다시 표시 — "
+            "탐지 결과 자체는 유지됩니다)."
+        )
+
     header = st.columns([2, 3, 1.2, 1.2, 1.2, 1, 1])
     for col, name in zip(header, ["ID", "유형", "신뢰도", "출처", "상태", "", ""]):
         col.markdown(f"**{name}**")
 
-    for c in cands:
+    for c in visible:
         row = st.columns([2, 3, 1.2, 1.2, 1.2, 1, 1])
         row[0].code(c.id, language=None)
         idx = TYPE_KEYS.index(c.defect_type) if c.defect_type in TYPE_KEYS else TYPE_KEYS.index("unknown")
@@ -822,9 +862,14 @@ def _render_approve() -> None:
             st.error(f"아카이브 저장에 실패했습니다: {exc}")
         else:
             st.session_state["wb_archived"] = True
+            elapsed_txt = (
+                f" · 판독 소요 {record.elapsed_seconds / 60:.1f}분"
+                if record.elapsed_seconds is not None
+                else ""
+            )
             st.success(
-                f"승인 완료 — 아카이브에 저장되었습니다 (record_id: {record.record_id}). "
-                "이 승인 기록은 자기개선 루프의 학습 라벨이 됩니다."
+                f"승인 완료 — 아카이브에 저장되었습니다 (record_id: {record.record_id}"
+                f"{elapsed_txt}). 이 승인 기록은 자기개선 루프의 학습 라벨이 됩니다."
             )
             pdf = try_build_pdf(record)
             if pdf:
@@ -911,6 +956,14 @@ def render_tab_archive() -> None:
         st.info("조건에 맞는 기록이 없습니다.")
         return
     st.dataframe(df, width="stretch", hide_index=True)
+    st.download_button(
+        "검색 결과 CSV 다운로드",
+        data=df.to_csv(index=False).encode("utf-8-sig"),  # utf-8-sig: 엑셀 한글 호환
+        file_name=f"rt_archive_{datetime.now():%Y%m%d_%H%M%S}.csv",
+        mime="text/csv",
+        key="wb_btn_csv",
+        help="선주·선급 요청 대응용 — 현재 필터의 검색 결과를 엑셀에서 열리는 CSV로 저장합니다.",
+    )
 
     st.markdown("**상세 보기**")
     rid = st.selectbox("record_id 선택", list(df["record_id"]), key="wb_detail_rid")
@@ -929,11 +982,13 @@ def render_tab_archive() -> None:
     info = pd.DataFrame(
         {
             "항목": ["필름 ID", "블록", "용접부 ID", "이음 종류", "두께(mm)", "품질등급",
-                    "판독원", "기법", "스케일(mm/px)", "이미지", "승인 일시", "초안 경로"],
+                    "판독원", "기법", "스케일(mm/px)", "이미지", "승인 일시", "초안 경로",
+                    "판독 소요시간"],
             "값": [ctx.film_id, ctx.block, ctx.weld_id, ctx.joint_type,
                    ctx.thickness_mm, ctx.quality_level, ctx.inspector, ctx.technique,
                    f"{ctx.scale_mm_per_px:.4f}" if ctx.scale_mm_per_px else "미확정",
-                   rec.image_name, rec.created_at, rec.report_source],
+                   rec.image_name, rec.created_at, rec.report_source,
+                   f"{rec.elapsed_seconds / 60:.1f}분" if rec.elapsed_seconds else "기록 없음"],
         }
     )
     c1, c2 = st.columns([1, 1])
@@ -980,12 +1035,15 @@ def render_tab_loop() -> None:
     m1.metric("총 검사", stats.get("total", 0))
     m2.metric("합격", stats.get("passed", 0))
     m3.metric("불합격", stats.get("failed", 0))
-    m4, m5, m6 = st.columns(3)
+    m4, m5, m6, m7 = st.columns(4)
     m4.metric("AI 제안", stats.get("ai_proposed", 0))
     rate = stats.get("acceptance_rate")
     m5.metric("AI 채택률", f"{rate * 100:.0f}%" if rate is not None else "—")
     m6.metric("사람 추가 (미탐 신호)", stats.get("human_added", 0),
               help="AI가 놓쳐 판독원이 직접 추가한 결함 수 — 탐지기 개선의 최우선 신호입니다.")
+    avg_el = stats.get("avg_elapsed_seconds")
+    m7.metric("평균 판독 소요", f"{avg_el / 60:.1f}분" if avg_el else "—",
+              help="이미지 로드→승인까지 자동 측정 — 수기 대비 절감 시간(창출 효과)의 정량 근거입니다.")
 
     counts = stats.get("defect_type_counts") or {}
     st.markdown("**결함 유형 분포 (채택 기준)**")
@@ -1017,6 +1075,38 @@ def render_tab_loop() -> None:
                 f"라벨 {result.get('labels', 0)}줄"
             )
             st.code(str(result.get("out_dir", out_dir)), language=None)
+
+    st.divider()
+    st.markdown("**아카이브 백업 · 복원**")
+    st.caption(
+        "전체 승인 기록을 JSON 파일로 내려받아 보관하고, 다른 PC나 (재시작 시 저장소가 "
+        "초기화되는) 클라우드 배포 환경에서 복원할 수 있습니다."
+    )
+    b1, b2 = st.columns([1, 2])
+    with b1:
+        try:
+            backup_text = archive_db.Archive().export_all_json()
+        except Exception as exc:
+            st.error(f"백업 생성에 실패했습니다: {exc}")
+            backup_text = ""
+        st.download_button(
+            "JSON 백업 다운로드",
+            data=backup_text.encode("utf-8"),
+            file_name=f"rt_archive_backup_{datetime.now():%Y%m%d_%H%M%S}.jsonl",
+            mime="application/json",
+            key="wb_btn_backup",
+            disabled=not backup_text,
+        )
+    with b2:
+        up = st.file_uploader("백업 파일 복원 (.jsonl)", type=["jsonl", "json", "txt"],
+                              key="wb_backup_upload")
+        if up is not None and st.button("복원 실행", key="wb_btn_restore"):
+            try:
+                n = archive_db.Archive().import_json(up.getvalue().decode("utf-8"))
+            except Exception as exc:
+                st.error(f"복원에 실패했습니다: {exc}")
+            else:
+                st.success(f"복원 완료 — {n}건 (같은 record_id는 교체되었습니다).")
 
 
 # ---------------------------------------------------------------------------

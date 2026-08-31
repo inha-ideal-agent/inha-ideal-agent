@@ -61,6 +61,18 @@ python3 scripts/demo_e2e.py
 python3 -m pytest tests/ -q
 ```
 
+## 웹 배포 (아이패드·외부 접속용) — 데모 목적은 전부 무료
+
+| 방법 | 비용 | 특징 |
+|---|---|---|
+| 같은 와이파이 접속 | 무료 | PC에서 실행 → 태블릿/폰이 `http://<PC IP>:8501` 접속 (런처가 주소 표시) |
+| [Streamlit Community Cloud](https://share.streamlit.io) | 무료 | GitHub 연결 → 브랜치·`rt-workbench/app.py` 지정하면 공개 URL 발급. 일정 시간 미사용 시 슬립(첫 접속 시 깨어남), 재시작 시 저장소 초기화 |
+| Hugging Face Spaces | 무료 티어 | 동봉된 `Dockerfile`로 배포 가능 |
+| 소형 VPS (Lightsail 등) | 월 ~5천 원 | 항상 켜짐 + 데이터 영속 필요할 때만 |
+
+무료 클라우드는 재시작 시 SQLite DB가 초기화되므로, **자기개선 루프 탭의
+"JSON 백업 다운로드 / 복원"**으로 아카이브를 보존·복원하세요.
+
 ## 데모 시나리오 (판독원의 5분)
 
 1. **필름 로드**: 샘플 선택 또는 스캔 이미지 업로드 → CLAHE 대비 향상 토글

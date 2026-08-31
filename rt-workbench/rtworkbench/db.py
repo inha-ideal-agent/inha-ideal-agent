@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS inspections (
     image_name     TEXT NOT NULL DEFAULT '',
     image_w        INTEGER,
     image_h        INTEGER,
+    elapsed_seconds REAL,
     payload_json   TEXT NOT NULL
 );
 
@@ -108,6 +109,11 @@ class Archive:
         # 스키마 생성(멱등)
         with closing(self._connect()) as conn, conn:
             conn.executescript(_SCHEMA)
+            # 구버전 DB 마이그레이션: elapsed_seconds 컬럼이 없으면 추가
+            try:
+                conn.execute("ALTER TABLE inspections ADD COLUMN elapsed_seconds REAL")
+            except sqlite3.OperationalError:
+                pass  # 이미 존재
 
     # ------------------------------------------------------------------ 내부
 
@@ -135,8 +141,8 @@ class Archive:
                     record_id, created_at, film_id, block, weld_id, joint_type,
                     thickness_mm, quality_level, inspector, overall_passed,
                     defect_count, report_text, report_source, image_name,
-                    image_w, image_h, payload_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    image_w, image_h, elapsed_seconds, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.record_id,
@@ -155,6 +161,7 @@ class Archive:
                     record.image_name,
                     int(record.image_size[0]),
                     int(record.image_size[1]),
+                    record.elapsed_seconds,
                     record.to_json(),
                 ),
             )
@@ -315,6 +322,10 @@ class Archive:
             human_added = conn.execute(
                 "SELECT COUNT(*) FROM defects WHERE source = 'human'"
             ).fetchone()[0]
+            avg_elapsed = conn.execute(
+                "SELECT AVG(elapsed_seconds) FROM inspections "
+                "WHERE elapsed_seconds IS NOT NULL"
+            ).fetchone()[0]
 
         return {
             "total": total,
@@ -326,7 +337,41 @@ class Archive:
             "ai_rejected": ai_rejected,
             "human_added": human_added,  # AI 미탐 신호
             "acceptance_rate": (ai_accepted / ai_proposed) if ai_proposed > 0 else None,
+            "avg_elapsed_seconds": avg_elapsed,  # 평균 판독 소요시간 (창출 효과 지표)
         }
+
+    # ------------------------------------------------------------------ 백업/복원
+
+    def export_all_json(self) -> str:
+        """전체 기록을 JSON Lines(줄당 1건)로 반환 — 백업/이관용.
+
+        클라우드 배포처럼 저장소가 휘발되는 환경에서 아카이브를 파일로
+        내려받아 두었다가 import_json 으로 복원한다.
+        """
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                "SELECT payload_json FROM inspections ORDER BY created_at, record_id"
+            ).fetchall()
+        return "\n".join(r[0] for r in rows) + ("\n" if rows else "")
+
+    def import_json(self, text: str) -> int:
+        """export_all_json 백업(JSON Lines)을 복원한다. 반환: 복원 건수.
+
+        같은 record_id는 교체(save와 동일). 파손된 줄이 하나라도 있으면
+        해당 줄에서 ValueError — 그 이전 줄들은 이미 저장되어 있다.
+        """
+        count = 0
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = InspectionRecord.from_json(line)
+            except Exception as exc:
+                raise ValueError(f"백업 {lineno}번째 줄 파싱 실패: {exc}") from exc
+            self.save(record)
+            count += 1
+        return count
 
     # ------------------------------------------------------------------ 라벨 export
 

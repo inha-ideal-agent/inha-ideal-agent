@@ -149,6 +149,7 @@ class InspectionRecord:
     image_name: str  # 원본 파일명 (이미지 자체는 로컬 보관, DB에는 경로/이름만)
     image_size: tuple[int, int]  # (width, height) px — 라벨 export 시 정규화에 필요
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    elapsed_seconds: float | None = None  # 이미지 로드→승인 소요시간 (창출 효과 정량화)
 
     def to_json(self) -> str:
         d = {
@@ -163,6 +164,7 @@ class InspectionRecord:
             "image_name": self.image_name,
             "image_size": list(self.image_size),
             "created_at": self.created_at,
+            "elapsed_seconds": self.elapsed_seconds,
         }
         return json.dumps(d, ensure_ascii=False)
 
@@ -181,4 +183,5 @@ class InspectionRecord:
             image_name=d["image_name"],
             image_size=tuple(d["image_size"]),
             created_at=d["created_at"],
+            elapsed_seconds=d.get("elapsed_seconds"),  # 구버전 백업엔 없음 — None 허용
         )
