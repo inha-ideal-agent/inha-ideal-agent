@@ -93,6 +93,16 @@ def find_free_port(start: int = 8501, tries: int = 50) -> int:
     return start
 
 
+def lan_ip() -> str | None:
+    """같은 네트워크의 태블릿/폰에서 접속할 수 있는 이 PC의 IP를 얻는다."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))  # 실제 전송 없음 — 라우팅 결정용
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
 def main() -> None:
     check_deps()
     ensure_samples()
@@ -100,7 +110,14 @@ def main() -> None:
 
     port = find_free_port()
     print(f"\nRT 판독 워크벤치를 시작합니다 → http://localhost:{port}")
-    print("브라우저 창이 자동으로 열립니다. 종료하려면 이 창에서 Ctrl+C.\n")
+    print("브라우저 창이 자동으로 열립니다. 종료하려면 이 창에서 Ctrl+C.")
+    ip = lan_ip()
+    if ip:
+        print("─" * 56)
+        print(f"  📱 아이패드/폰(같은 와이파이)에서 접속: http://{ip}:{port}")
+        print("     ※ 안 열리면 PC 방화벽에서 Python의 네트워크 허용 필요")
+        print("─" * 56)
+    print()
 
     # streamlit CLI를 프로세스 내에서 직접 구동 — 사용자는 명령을 칠 필요가 없다.
     # (headless가 아니므로 streamlit이 기본 브라우저를 자동으로 연다.)
