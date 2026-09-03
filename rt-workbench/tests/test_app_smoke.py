@@ -116,3 +116,43 @@ def test_detection_success_notice_visible():
     assert not at.exception
     assert at.session_state["wb_candidates"]  # 후보는 추가되고
     assert any("기각" in s.value for s in at.success)  # 안내문도 남는다
+
+
+def test_eval_window_change_invalidates_judgment():
+    """회귀 방지: 판정 후 평가 길이/용접부 폭 변경 시 기존 verdict/overall 무효화."""
+    for key, value in (("wb_ctx_eval_len", 200.0), ("wb_ctx_weld_w", 30.0)):
+        at = _boot_with_image()
+        at.session_state["wb_overall"] = True
+        at.run(timeout=60)
+        at.number_input(key=key).set_value(value)
+        at.run(timeout=60)
+        assert not at.exception
+        assert at.session_state["wb_overall"] is None, key
+
+
+def test_judgment_appends_group_verdict_using_sidebar_eval_window():
+    """판정 실행 → 단일 verdict 뒤에 그룹 verdict, 사이드바 평가 길이/용접부 폭이 반영된다."""
+    from rtworkbench.models import DefectCandidate, Measurement
+
+    at = _boot_with_image()
+    at.session_state["wb_candidates"] = [
+        DefectCandidate(id="p1", defect_type="porosity", bbox=(10, 10, 30, 30),
+                        confidence=1.0, source="human", status="accepted"),
+    ]
+    at.session_state["wb_measurements"] = {
+        "p1": Measurement(defect_id="p1", p1=(0.0, 0.0), p2=(0.0, 20.0),
+                          length_px=20.0, length_mm=2.0),
+    }
+    at.session_state["wb_scale_mm_per_px"] = 0.1  # 20px → 2.0mm
+    at.run(timeout=60)
+    at.number_input(key="wb_ctx_eval_len").set_value(50.0)
+    at.number_input(key="wb_ctx_weld_w").set_value(10.0)
+    at.run(timeout=60)
+    _button(at, "wb_btn_judge").click()
+    at.run(timeout=60)
+    assert not at.exception
+    verdicts = at.session_state["wb_verdicts"]
+    assert [v.defect_id for v in verdicts] == ["p1", "GROUP:porosity"]
+    g = verdicts[-1]
+    assert g.unit == "%" and "평가길이 50mm × 용접부 폭 10mm" in g.detail
+    assert at.session_state["wb_overall"] is True

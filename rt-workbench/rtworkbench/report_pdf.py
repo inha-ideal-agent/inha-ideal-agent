@@ -31,6 +31,7 @@ _FONT = "HYSMyeongJo-Medium"
 _SOURCE_KO = {
     "claude": "Claude API",
     "gemini": "Gemini API",
+    "local": "로컬 LLM (온프레미스)",
     "template": "오프라인 템플릿",
     "cache": "로컬 캐시(API 사전 생성)",
 }
@@ -119,6 +120,10 @@ def build_pdf(record: InspectionRecord) -> bytes:
         ("모재 두께", f"{ctx.thickness_mm:g} mm", "품질 등급", ctx.quality_level or "-"),
         ("판독원", ctx.inspector or "-", "검사 기법", ctx.technique or "-"),
         ("스케일", scale_txt, "원본 이미지", record.image_name or "-"),
+        (
+            "평가 길이", f"{ctx.eval_length_mm:g} mm",
+            "용접부 폭", f"{ctx.weld_width_mm:g} mm",
+        ),
     ]
     info_data = [
         [Paragraph(_xml(cell), st["cell"]) for cell in row] for row in info_rows
@@ -141,16 +146,17 @@ def build_pdf(record: InspectionRecord) -> bytes:
 
     # ------------------------------------------------------------ 결함 판정 표
     story.append(Paragraph("2. 결함 판정 (결정론적 룰 엔진)", st["h2"]))
-    head = ("ID", "유형", "크기 (mm)", "허용한계 (mm)", "근거 조항", "합부")
+    # 단위는 셀마다 명시한다 — 단일 판정은 mm, 투영 면적률 그룹 판정은 %
+    head = ("ID", "유형", "크기", "허용한계", "근거 조항", "합부")
     rows: list[tuple[str, ...]] = [head]
     if record.verdicts:
         for v in record.verdicts:
             rows.append(
                 (
-                    v.defect_id,
+                    v.display_id,  # 그룹 판정은 '합계(기공)' 형태
                     DEFECT_TYPES.get(v.defect_type, v.defect_type),
-                    f"{v.size_mm:.2f}",
-                    "허용 불가" if v.limit_mm is None else f"{v.limit_mm:.2f}",
+                    f"{v.size_mm:.2f} {v.unit}",
+                    "허용 불가" if v.limit_mm is None else f"{v.limit_mm:.2f} {v.unit}",
                     v.clause,
                     "합격" if v.passed else "불합격",
                 )
@@ -176,6 +182,14 @@ def build_pdf(record: InspectionRecord) -> bytes:
             verdict_style.append(("TEXTCOLOR", (0, i), (-1, i), _FAIL))
     verdict_table.setStyle(TableStyle(verdict_style))
     story.append(verdict_table)
+    if any(v.is_group for v in record.verdicts):
+        story.append(
+            Paragraph(
+                "합계 행 = 유형별 그룹 판정: 누적 길이(평가 길이 내 길이 합) · "
+                "투영 면적률(원 근사 면적 합 ÷ 평가 길이 × 용접부 폭, %).",
+                st["footer"],
+            )
+        )
     story.append(Spacer(1, 5 * mm))
 
     # ------------------------------------------------------------ 종합 판정 (크게)

@@ -366,3 +366,47 @@ def test_try_anthropic_uses_bounded_timeout(monkeypatch, tmp_path):
     timeout = captured.get("timeout")
     assert isinstance(timeout, (int, float)) and timeout <= 60
     assert captured.get("max_retries") == 0
+
+
+# ---------------------------------------------------------------- 그룹 판정 (단위 %)
+
+
+def _group_verdict() -> RuleVerdict:
+    return RuleVerdict(
+        defect_id="GROUP:porosity",
+        defect_type="porosity",
+        size_mm=0.63,
+        quality_level="B",
+        thickness_mm=12.0,
+        limit_mm=1.0,
+        passed=True,
+        clause="DEMO-2012-AREA",
+        detail="기공 3건 원 근사 면적 합 12.57mm² ÷ (평가길이 100mm × 용접부 폭 20mm) = 0.63% ≤ 한계 1.0% → 합격",
+        unit="%",
+    )
+
+
+def test_build_payload_group_verdict_uses_percent_unit_and_sum_label(context, verdicts, measurements):
+    payload = build_payload(context, verdicts + [_group_verdict()], measurements)
+    assert "합계(기공)" in payload
+    assert "크기 0.63 %" in payload and "허용한계 1.00 %" in payload
+    assert "0.63 mm" not in payload
+    # 단일 verdict 표기는 그대로 mm
+    assert "3.20 mm" in payload and "허용한계 2.40 mm" in payload
+
+
+def test_build_pdf_with_group_verdict(context, verdicts):
+    rec = InspectionRecord(
+        record_id="rec-group001",
+        context=context,
+        candidates=[],
+        measurements=[],
+        verdicts=verdicts + [_group_verdict()],
+        overall_passed=False,
+        report_text="본문",
+        report_source="template",
+        image_name=IMAGE_NAME,
+        image_size=(800, 600),
+    )
+    pdf = build_pdf(rec)
+    assert pdf.startswith(b"%PDF") and len(pdf) > 1500

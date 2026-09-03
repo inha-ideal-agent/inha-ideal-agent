@@ -3,14 +3,19 @@
 데모 기준표(demo_iso5817_like.json)의 수치를 그대로 사용한다:
   porosity B: coef 0.2, cap 3.0 / crack: 전 등급 불허 /
   lack_of_fusion: B·C 불허, D는 coef 0.25, cap 25.0
+  그룹 판정 — porosity area_ratio: B 1.0% / C 1.5% / D 2.0% ;
+             slag_inclusion cumulative_length B: coef 0.5, cap 12.5 ;
+             lack_of_fusion cumulative_length: B·C 불허, D coef 0.25, cap 25.0
 """
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from rtworkbench.models import RuleVerdict
-from rtworkbench.rules import RuleEngine, overall_pass
+from rtworkbench.rules import RuleEngine, is_group_verdict, overall_pass
 
 
 @pytest.fixture(scope="module")
@@ -219,8 +224,11 @@ def test_evaluate_all_순서_보존(engine):
         ("df-2", "undercut", 0.1),
     ]
     verdicts = engine.evaluate_all(items, thickness_mm=12.0, quality_level="B")
-    assert [v.defect_id for v in verdicts] == ["df-3", "df-1", "df-2"]
-    assert [v.defect_type for v in verdicts] == ["porosity", "crack", "undercut"]
+    singles = [v for v in verdicts if not is_group_verdict(v)]
+    assert [v.defect_id for v in singles] == ["df-3", "df-1", "df-2"]
+    assert [v.defect_type for v in singles] == ["porosity", "crack", "undercut"]
+    # 그룹 verdict는 단일 verdict 뒤에 덧붙는다 (세 유형 중 group 블록은 기공만 보유)
+    assert [v.defect_id for v in verdicts[len(singles):]] == ["GROUP:porosity"]
 
 
 def test_overall_pass_전부_합격이면_True(engine):
@@ -277,3 +285,241 @@ def test_verdict_필드_계약(engine):
     assert v.thickness_mm == 12.0
     # porosity C: min(0.25×12=3.0, 4.0) = 3.0
     assert v.limit_mm == 3.0
+
+
+# ═══════════════ 그룹 판정: 유형별 누적 길이 · 투영 면적률 ═══════════════
+
+
+def _group(verdicts: list[RuleVerdict], dtype: str) -> RuleVerdict:
+    gs = [v for v in verdicts if v.defect_id == f"GROUP:{dtype}"]
+    assert len(gs) == 1, [v.defect_id for v in verdicts]
+    return gs[0]
+
+
+# ───────────── 투영 면적률 (area_ratio): 기공 ─────────────
+
+
+def test_면적률_스펙_예시_기공3건_12p57mm2는_0p63pct_합격(engine):
+    # 3건 × π(d/2)² = 12.57mm² 가 되는 d ≈ 2.31 → 12.57 ÷ (100 × 20) × 100 = 0.63% ≤ 1.0%
+    d = math.sqrt(12.57 * 4 / (3 * math.pi))
+    verdicts = engine.evaluate_all(
+        [("a", "porosity", d), ("b", "porosity", d), ("c", "porosity", d)],
+        thickness_mm=12.0, quality_level="B", eval_length_mm=100.0, weld_width_mm=20.0,
+    )
+    g = _group(verdicts, "porosity")
+    assert g.unit == "%"
+    assert g.size_mm == 0.63 and g.limit_mm == 1.0 and g.passed is True
+    assert g.clause == "DEMO-2012-AREA" and g.quality_level == "B" and g.thickness_mm == 12.0
+    assert (
+        "기공 3건 원 근사 면적 합 12.57mm² ÷ (평가길이 100mm × 용접부 폭 20mm) "
+        "= 0.63% ≤ 한계 1.0% → 합격"
+    ) in g.detail
+
+
+def test_면적률_개별은_전부_합격이어도_합계_초과면_그룹_불합격(engine):
+    # 5 × d=2.4(단일 한계와 동치) → 5 × π × 1.2² = 22.62mm² ÷ 2000mm² = 1.13% > 1.0%
+    verdicts = engine.evaluate_all(
+        [(f"p{i}", "porosity", 2.4) for i in range(5)], thickness_mm=12.0, quality_level="B"
+    )
+    assert all(v.passed for v in verdicts if not is_group_verdict(v))
+    g = _group(verdicts, "porosity")
+    assert g.size_mm == 1.13 and g.limit_mm == 1.0 and g.passed is False
+    assert "22.62mm²" in g.detail and "> 한계 1.0%" in g.detail and "불합격" in g.detail
+    assert overall_pass(verdicts) is False  # 그룹 verdict가 종합 판정에 반영된다
+
+
+@pytest.mark.parametrize(
+    "weld_w, ratio, passed",
+    [(3.1416, 1.0, True), (3.14, 1.0, True), (3.12, 1.01, False)],
+)
+def test_면적률_경계_반올림_정책_경계_동치는_합격(engine, weld_w, ratio, passed):
+    # d=2.0 → 면적 π mm² ; 분모 100 × W → 면적률 = 314.159… ÷ (100·W) %
+    g = engine.evaluate_group(
+        "porosity", [2.0], 12.0, "B", eval_length_mm=100.0, weld_width_mm=weld_w
+    )
+    assert g.size_mm == ratio and g.limit_mm == 1.0 and g.passed is passed
+    assert g.passed == (g.size_mm <= g.limit_mm)  # 저장값 자기모순 없음
+
+
+@pytest.mark.parametrize("level, limit", [("B", 1.0), ("C", 1.5), ("D", 2.0)])
+def test_면적률_등급별_한계(engine, level, limit):
+    g = engine.evaluate_group("porosity", [1.0], 12.0, level)
+    assert g.limit_mm == limit and g.unit == "%" and g.quality_level == level
+
+
+def test_평가구간이_바뀌면_면적률이_바뀐다(engine):
+    # d=2.0: 100×20 → 0.157% ≈ 0.16 ; 50×10(1/4 면적) → 0.628% ≈ 0.63
+    assert engine.evaluate_group("porosity", [2.0], 12.0, "B").size_mm == 0.16
+    g = engine.evaluate_group(
+        "porosity", [2.0], 12.0, "B", eval_length_mm=50.0, weld_width_mm=10.0
+    )
+    assert g.size_mm == 0.63 and "평가길이 50mm × 용접부 폭 10mm" in g.detail
+
+
+# ───────────── 누적 길이 (cumulative_length): 슬래그 · 융합불량 ─────────────
+
+
+def test_누적길이_슬래그_B_t12_한계_6p0_합격(engine):
+    # min(0.5×12=6.0, 12.5) = 6.0 ; 2.0+2.0+1.5 = 5.5 ≤ 6.0
+    verdicts = engine.evaluate_all(
+        [("s1", "slag_inclusion", 2.0), ("s2", "slag_inclusion", 2.0), ("s3", "slag_inclusion", 1.5)],
+        thickness_mm=12.0, quality_level="B",
+    )
+    g = _group(verdicts, "slag_inclusion")
+    assert g.unit == "mm"
+    assert g.size_mm == 5.5 and g.limit_mm == 6.0 and g.passed is True
+    assert g.clause == "DEMO-302-CUM"
+    for token in ("슬래그 개재물 3건", "(2.0 + 2.0 + 1.5) = 5.5mm", "계수 0.5",
+                  "cap 12.5mm", "허용 한계 6.0mm", "누적 5.5mm ≤ 한계", "합격"):
+        assert token in g.detail, f"detail에 '{token}' 누락: {g.detail}"
+
+
+def test_누적길이_경계_동치는_합격_초과는_불합격(engine):
+    g = engine.evaluate_group("slag_inclusion", [2.0, 2.0, 2.0], 12.0, "B")
+    assert g.size_mm == 6.0 and g.limit_mm == 6.0 and g.passed is True
+    g2 = engine.evaluate_group("slag_inclusion", [2.0, 2.0, 2.0, 1.0], 12.0, "B")
+    assert g2.size_mm == 7.0 and g2.passed is False and "누적 7.0mm > 한계" in g2.detail
+    assert g2.passed == (g2.size_mm <= g2.limit_mm)
+
+
+def test_누적길이_개별은_전부_합격이어도_합계_초과면_종합_불합격(engine):
+    # 단일 한계 min(0.2×12=2.4, 2.0) = 2.0 → 각각 합격 ; 누적 8.0 > 6.0 → 그룹 불합격
+    verdicts = engine.evaluate_all(
+        [(f"s{i}", "slag_inclusion", 2.0) for i in range(4)], thickness_mm=12.0, quality_level="B"
+    )
+    assert all(v.passed for v in verdicts if not is_group_verdict(v))
+    assert _group(verdicts, "slag_inclusion").passed is False
+    assert overall_pass(verdicts) is False
+
+
+def test_누적길이_cap이_지배(engine):
+    # min(0.5×30=15.0, 12.5) = 12.5
+    assert engine.evaluate_group("slag_inclusion", [1.0], 30.0, "B").limit_mm == 12.5
+
+
+@pytest.mark.parametrize("level", ["B", "C"])
+def test_누적길이_융합불량_B_C는_불허_permitted_false(engine, level):
+    g = engine.evaluate_group("lack_of_fusion", [1.0, 2.0], 12.0, level)
+    assert g.passed is False and g.limit_mm is None
+    assert g.size_mm == 3.0 and g.unit == "mm"  # 집계값은 기록한다
+    assert g.clause == "DEMO-401-CUM"
+    assert "허용되지 않음" in g.detail and f"품질등급 {level}" in g.detail
+
+
+def test_누적길이_융합불량_D는_허용(engine):
+    # min(0.25×12=3.0, 25.0) = 3.0 ; 1.0+2.0 = 3.0 → 경계 동치 합격
+    g = engine.evaluate_group("lack_of_fusion", [1.0, 2.0], 12.0, "D")
+    assert g.limit_mm == 3.0 and g.passed is True
+
+
+# ───────────── 공통 계약 ─────────────
+
+
+def test_group_블록_없는_유형은_그룹_verdict가_없다(engine):
+    verdicts = engine.evaluate_all(
+        [("c1", "crack", 1.0), ("u1", "undercut", 0.1), ("cp", "cluster_porosity", 1.0)],
+        thickness_mm=12.0, quality_level="B",
+    )
+    assert len(verdicts) == 3 and not any(is_group_verdict(v) for v in verdicts)
+    assert engine.evaluate_group("crack", [1.0], 12.0, "B") is None
+    assert engine.evaluate_group("porosity", [], 12.0, "B") is None  # 집계 대상 없음
+    assert engine.evaluate_group("없는_유형", [1.0], 12.0, "B") is None
+
+
+def test_그룹_verdict는_유형별_1건_최초등장_순서(engine):
+    verdicts = engine.evaluate_all(
+        [("s1", "slag_inclusion", 1.0), ("p1", "porosity", 1.0),
+         ("s2", "slag_inclusion", 1.0), ("c1", "crack", 1.0)],
+        thickness_mm=12.0, quality_level="B",
+    )
+    assert [v.defect_id for v in verdicts] == [
+        "s1", "p1", "s2", "c1", "GROUP:slag_inclusion", "GROUP:porosity"
+    ]
+
+
+def test_그룹_verdict_ID_및_표시명(engine):
+    g = engine.evaluate_group("porosity", [1.0], 12.0, "B")
+    assert g.defect_id == "GROUP:porosity" and g.defect_type == "porosity"
+    assert is_group_verdict(g) and g.is_group and g.display_id == "합계(기공)"
+    s = engine.evaluate("df-1", "porosity", 1.0, thickness_mm=12.0, quality_level="B")
+    assert not is_group_verdict(s) and not s.is_group and s.display_id == "df-1"
+
+
+def test_unit_필드_기본값_mm_면적률은_pct_직렬화_왕복(engine):
+    s = engine.evaluate("df-1", "porosity", 1.0, thickness_mm=12.0, quality_level="B")
+    assert s.unit == "mm" and s.to_dict()["unit"] == "mm"
+    g = engine.evaluate_group("porosity", [1.0], 12.0, "B")
+    assert g.unit == "%" and RuleVerdict.from_dict(g.to_dict()) == g
+    legacy = {k: v for k, v in s.to_dict().items() if k != "unit"}  # unit 없는 구버전 기록
+    assert RuleVerdict.from_dict(legacy).unit == "mm"
+
+
+def test_evaluate_all_3인자_호출_호환_기본_평가구간_100x20(engine):
+    items = [("a", "porosity", 2.0), ("b", "slag_inclusion", 1.0)]
+    old = engine.evaluate_all(items, 12.0, "B")
+    new = engine.evaluate_all(items, 12.0, "B", eval_length_mm=100.0, weld_width_mm=20.0)
+    assert old == new and len(old) == 4
+    assert "평가길이 100mm × 용접부 폭 20mm" in _group(old, "porosity").detail
+
+
+@pytest.mark.parametrize(
+    "kw", [{"eval_length_mm": 0.0}, {"eval_length_mm": -1.0}, {"weld_width_mm": 0.0}]
+)
+def test_평가길이_용접부폭_0이하는_ValueError(engine, kw):
+    with pytest.raises(ValueError):
+        engine.evaluate_all([("a", "porosity", 1.0)], 12.0, "B", **kw)
+    with pytest.raises(ValueError):
+        engine.evaluate_group("porosity", [1.0], 12.0, "B", **kw)
+
+
+def test_그룹_판정도_입력검증(engine):
+    with pytest.raises(ValueError):
+        engine.evaluate_group("porosity", [1.0, -0.1], 12.0, "B")
+    with pytest.raises(ValueError):
+        engine.evaluate_group("porosity", [1.0], 12.0, "A")
+    with pytest.raises(ValueError):
+        engine.evaluate_group("porosity", [1.0], 0.0, "B")
+
+
+# ───────────── 기준표 group 블록 검증 ─────────────
+
+_GROUP_BASE = (
+    '{"meta": {"quality_levels": ["B"]}, '
+    '"rules": {"porosity": {"clause": "X-1", '
+    '"levels": {"B": {"permitted": true, "coef_thickness": 0.2, "cap_mm": 3.0}}, '
+    '"group": %s}}, '
+    '"default_rule": {"clause": "X-0", "detail": "수동 판정 필요"}}'
+)
+
+
+@pytest.mark.parametrize(
+    "group_json",
+    [
+        '"문자열"',  # dict 아님
+        '{"mode": "volume_ratio", "clause": "G", "levels": {"B": {"limit_pct": 1}}}',  # 미지 mode
+        '{"mode": "area_ratio", "levels": {"B": {"limit_pct": 1}}}',  # clause 누락
+        '{"mode": "area_ratio", "clause": "G"}',  # levels 누락
+        '{"mode": "area_ratio", "clause": "G", "levels": {}}',  # 선언 등급 B 누락
+        '{"mode": "area_ratio", "clause": "G", "levels": {"B": {}}}',  # limit_pct 누락
+        '{"mode": "area_ratio", "clause": "G", "levels": {"B": {"limit_pct": "1"}}}',  # 숫자 아님
+        '{"mode": "cumulative_length", "clause": "G", '
+        '"levels": {"B": {"permitted": true, "coef_thickness": 0.5}}}',  # cap_mm 누락
+        '{"mode": "cumulative_length", "clause": "G", "levels": {"B": "x"}}',  # 등급 entry dict 아님
+    ],
+)
+def test_기준표_group_블록_형식_오류는_로드시_ValueError(tmp_path, group_json):
+    bad = tmp_path / "bad_group.json"
+    bad.write_text(_GROUP_BASE % group_json, encoding="utf-8")
+    with pytest.raises(ValueError):
+        RuleEngine(bad)
+
+
+def test_기준표_group_불허_등급은_한계_수치_없이_로드된다(tmp_path):
+    ok = tmp_path / "ok_group.json"
+    ok.write_text(
+        _GROUP_BASE % '{"mode": "cumulative_length", "clause": "G", '
+        '"levels": {"B": {"permitted": false}}}',
+        encoding="utf-8",
+    )
+    g = RuleEngine(ok).evaluate_group("porosity", [1.0], 12.0, "B")
+    assert g.passed is False and g.limit_mm is None and g.clause == "G"

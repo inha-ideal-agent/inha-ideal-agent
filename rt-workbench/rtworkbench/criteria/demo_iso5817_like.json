@@ -4,7 +4,12 @@
     "version": "0.1-demo",
     "disclaimer": "본 기준표의 수치는 ISO 5817 계열의 '구조'를 모사한 데모 값이며 실제 규격 원문이 아닙니다. 실제 건조 선체의 생산 검사 합부 기준은 선급 NDT 지침 확인 및 도메인 멘토링으로 확정한 뒤, 이 JSON 파일만 교체하면 됩니다(룰 엔진 코드는 데이터 주도 설계로 무변경).",
     "quality_levels": ["B", "C", "D"],
-    "limit_formula": "limit_mm = min(coef_thickness × 모재두께 t, cap_mm); permitted=false이면 크기와 무관하게 허용 불가"
+    "limit_formula": "limit_mm = min(coef_thickness × 모재두께 t, cap_mm); permitted=false이면 크기와 무관하게 허용 불가",
+    "group_formulas": {
+      "note": "rules.<type>.group 블록(선택)은 유형별 그룹 판정을 추가한다. 단일 판정과 별개로 verdict 1건(defect_id='GROUP:<type>')이 덧붙는다.",
+      "area_ratio": "면적률[%] = Σ(π·(d/2)²) ÷ (eval_length_mm × weld_width_mm) × 100; d = 측정 최대 치수(원 근사). limit_pct 이하이면 합격. permitted=false이면 허용 불가.",
+      "cumulative_length": "누적 길이[mm] = 필름의 평가 길이(eval_length_mm) 내 같은 유형의 측정 길이 합 Σl; limit_mm = min(coef_thickness × t, cap_mm) 이하이면 합격. permitted=false이면 허용 불가."
+    }
   },
   "rules": {
     "porosity": {
@@ -15,6 +20,16 @@
         "B": { "permitted": true, "coef_thickness": 0.2, "cap_mm": 3.0 },
         "C": { "permitted": true, "coef_thickness": 0.25, "cap_mm": 4.0 },
         "D": { "permitted": true, "coef_thickness": 0.3, "cap_mm": 5.0 }
+      },
+      "group": {
+        "mode": "area_ratio",
+        "clause": "DEMO-2012-AREA",
+        "name_ko": "기공 투영 면적률",
+        "levels": {
+          "B": { "limit_pct": 1.0 },
+          "C": { "limit_pct": 1.5 },
+          "D": { "limit_pct": 2.0 }
+        }
       }
     },
     "cluster_porosity": {
@@ -45,6 +60,16 @@
         "B": { "permitted": false },
         "C": { "permitted": false },
         "D": { "permitted": true, "coef_thickness": 0.25, "cap_mm": 25.0 }
+      },
+      "group": {
+        "mode": "cumulative_length",
+        "clause": "DEMO-401-CUM",
+        "name_ko": "융합불량 누적 길이",
+        "levels": {
+          "B": { "permitted": false },
+          "C": { "permitted": false },
+          "D": { "permitted": true, "coef_thickness": 0.25, "cap_mm": 25.0 }
+        }
       }
     },
     "incomplete_penetration": {
@@ -55,6 +80,16 @@
         "B": { "permitted": false },
         "C": { "permitted": false },
         "D": { "permitted": true, "coef_thickness": 0.2, "cap_mm": 25.0 }
+      },
+      "group": {
+        "mode": "cumulative_length",
+        "clause": "DEMO-402-CUM",
+        "name_ko": "용입부족 누적 길이",
+        "levels": {
+          "B": { "permitted": false },
+          "C": { "permitted": false },
+          "D": { "permitted": true, "coef_thickness": 0.25, "cap_mm": 25.0 }
+        }
       }
     },
     "slag_inclusion": {
@@ -65,6 +100,16 @@
         "B": { "permitted": true, "coef_thickness": 0.2, "cap_mm": 2.0 },
         "C": { "permitted": true, "coef_thickness": 0.3, "cap_mm": 3.0 },
         "D": { "permitted": true, "coef_thickness": 0.4, "cap_mm": 4.0 }
+      },
+      "group": {
+        "mode": "cumulative_length",
+        "clause": "DEMO-302-CUM",
+        "name_ko": "슬래그 개재물 누적 길이",
+        "levels": {
+          "B": { "permitted": true, "coef_thickness": 0.5, "cap_mm": 12.5 },
+          "C": { "permitted": true, "coef_thickness": 1.0, "cap_mm": 25.0 },
+          "D": { "permitted": true, "coef_thickness": 1.5, "cap_mm": 37.5 }
+        }
       }
     },
     "undercut": {

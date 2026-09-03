@@ -382,6 +382,9 @@ def build_context_from_sidebar() -> InspectionContext:
         inspector=st.session_state.get("wb_ctx_inspector", ""),
         scale_mm_per_px=st.session_state.get("wb_scale_mm_per_px"),
         scale_ref=st.session_state.get("wb_scale_ref", ""),
+        # 그룹 판정(누적 길이·투영 면적률)의 기준 구간 — 사이드바 입력
+        eval_length_mm=float(st.session_state.get("wb_ctx_eval_len", 100.0)),
+        weld_width_mm=float(st.session_state.get("wb_ctx_weld_w", 20.0)),
     )
 
 
@@ -439,12 +442,13 @@ def verdicts_to_df(verdicts) -> pd.DataFrame:
     """RuleVerdict 목록 → 표시용 DataFrame."""
     rows = []
     for v in verdicts:
+        # 단위는 셀마다 명시 — 단일 판정 mm, 투영 면적률 그룹 판정 %
         rows.append(
             {
-                "결함 ID": v.defect_id,
+                "결함 ID": v.display_id,  # 그룹 판정은 '합계(기공)' 형태
                 "유형": DEFECT_TYPES.get(v.defect_type, v.defect_type),
-                "크기(mm)": v.size_mm,
-                "허용 한계(mm)": "허용 불가" if v.limit_mm is None else v.limit_mm,
+                "크기": f"{v.size_mm:.2f} {v.unit}",
+                "허용 한계": "허용 불가" if v.limit_mm is None else f"{v.limit_mm:.2f} {v.unit}",
                 "근거 조항": v.clause,
                 "합부": "✅ 합격" if v.passed else "❌ 불합격",
                 "판정 근거": v.detail,
@@ -761,7 +765,10 @@ def _render_judgment(ctx: InspectionContext) -> None:
             return
         try:
             engine = rules.RuleEngine()
-            verdicts = engine.evaluate_all(items, ctx.thickness_mm, ctx.quality_level)
+            verdicts = engine.evaluate_all(
+                items, ctx.thickness_mm, ctx.quality_level,
+                eval_length_mm=ctx.eval_length_mm, weld_width_mm=ctx.weld_width_mm,
+            )
         except Exception as exc:
             st.error(f"룰 판정에 실패했습니다: {exc}")
             return
@@ -774,6 +781,8 @@ def _render_judgment(ctx: InspectionContext) -> None:
     if overall is not None:
         if verdicts:
             st.dataframe(verdicts_to_df(verdicts), width="stretch", hide_index=True)
+            if any(rules.is_group_verdict(v) for v in verdicts):
+                st.caption("합계 행 = 누적 길이·투영 면적률(원 근사) 그룹 판정")
         else:
             st.caption("판정 대상 결함 없음 (채택+측정된 결함 0건).")
         if overall:
@@ -810,7 +819,7 @@ def _render_report(ctx: InspectionContext) -> None:
 
     source = st.session_state["wb_report_source"]
     if source:
-        badge = {"claude": "🟣 Claude", "gemini": "🔵 Gemini",
+        badge = {"local": "🟢 로컬 LLM", "claude": "🟣 Claude", "gemini": "🔵 Gemini",
                  "template": "⚙️ 오프라인 템플릿", "cache": "💾 캐시"}.get(source, source)
         st.markdown(f"초안 생성 경로: **{badge}** (`{source}`)")
     if st.session_state["wb_report_payload"]:
@@ -917,9 +926,148 @@ def render_tab_workbench(ctx: InspectionContext) -> None:
 # ---------------------------------------------------------------------------
 
 
+# LLM 경로 배지 (소견서/자연어 검색/이력 요약 공용)
+LLM_SOURCE_BADGE = {
+    "local": "🟢 로컬 LLM",
+    "claude": "🟣 Claude",
+    "gemini": "🔵 Gemini",
+    "template": "⚙️ 오프라인 템플릿",
+    "cache": "💾 캐시",
+    "rule": "📐 규칙 파서 (LLM 미사용)",
+}
+
+_NL_FILTER_LABELS = (
+    ("block", "블록"),
+    ("weld_id", "용접부 ID"),
+    ("defect_type", "결함 유형"),
+    ("passed", "합부"),
+    ("text", "자유 텍스트"),
+    ("date_from", "시작일"),
+    ("date_to", "종료일"),
+)
+
+
+def _nl_filter_display(key: str, value) -> str:
+    """자연어 해석 필터 값 → 표시 문자열."""
+    if key == "passed":
+        return "(전체)" if value is None else ("합격" if value else "불합격")
+    if key == "defect_type" and value:
+        return f"{DEFECT_TYPES.get(value, value)} ({value})"
+    return str(value) if value else "(전체)"
+
+
+def _render_history_summary(df: pd.DataFrame, *, key: str, question: str = "") -> None:
+    """[AI 이력 요약] 현재 표시된 검색 결과(최대 60건)를 LLM(로컬 우선)/템플릿으로 요약.
+
+    LLM 에는 비식별 집계·기록 목록만 전송 (판독원 실명·이미지·소견서 본문 제외).
+    요약은 확정 판정의 집계일 뿐 합부를 바꾸지 않는다.
+    """
+    from rtworkbench import report_llm  # 지연 import — 병렬 구현 모듈
+
+    n_cap = report_llm.HISTORY_MAX_RECORDS
+    ids = tuple(str(r) for r in list(df["record_id"])[:n_cap])
+    out_key = f"{key}_out"
+
+    if st.button(
+        "AI 이력 요약", key=key,
+        help=f"현재 결과 최대 {n_cap}건을 비식별 집계로 요약합니다 (로컬 LLM 우선, 실패 시 통계 템플릿).",
+    ):
+        try:
+            archive = archive_db.Archive()
+            recs = [archive.get(rid) for rid in ids]
+            recs = [r for r in recs if r is not None]
+            text, source = report_llm.summarize_history(recs, question=question)
+        except Exception as exc:
+            st.error(f"이력 요약에 실패했습니다: {exc}")
+        else:
+            st.session_state[out_key] = {
+                "ids": ids, "text": text, "source": source, "n": len(recs),
+            }
+
+    out = st.session_state.get(out_key)
+    if out and out.get("ids") == ids:  # 검색 결과가 바뀌면 이전 요약은 표시하지 않음
+        src = out["source"]
+        badge = LLM_SOURCE_BADGE.get(src, src)
+        st.markdown(f"요약 경로: **{badge}** (`{src}`) · 대상 {out['n']}건")
+        st.markdown(out["text"])
+        st.caption("🔒 비식별 집계만 전송 — 판독원 실명·이미지·소견서 본문은 LLM에 보내지 않습니다. "
+                   "요약은 합부를 변경하지 않습니다.")
+
+
+def _render_nl_search() -> None:
+    """[자연어로 찾기] LLM 은 질의에서 필터 추출만 — 검색 자체는 Archive.search(결정론적)."""
+    from rtworkbench import report_llm  # 지연 import — 병렬 구현 모듈
+
+    with st.container(border=True):
+        st.markdown("**🗣️ 자연어로 찾기**")
+        st.caption(
+            "예: '3번 블록에서 지난달 기공으로 불합격한 건' — LLM(로컬 우선, 실패 시 규칙 파서)은 "
+            "검색 필터만 추출하고, 검색은 결정론적 DB 조회로 수행합니다."
+        )
+        c1, c2 = st.columns([4, 1])
+        nl_q = c1.text_input(
+            "자연어 질의", key="wb_nl_query",
+            placeholder="예: 3번 블록에서 지난달 기공으로 불합격한 건",
+            label_visibility="collapsed",
+        )
+        if c2.button("해석해서 검색", key="wb_btn_nl_parse"):
+            try:
+                filters, source = report_llm.parse_search_query(nl_q or "")
+            except Exception as exc:
+                st.error(f"질의 해석에 실패했습니다: {exc}")
+            else:
+                st.session_state["wb_nl_filters"] = filters
+                st.session_state["wb_nl_source"] = source
+
+        filters = st.session_state.get("wb_nl_filters")
+        if not filters:
+            return
+        source = str(st.session_state.get("wb_nl_source", ""))
+        badge = LLM_SOURCE_BADGE.get(source, source)
+        st.markdown(f"해석 경로: **{badge}** (`{source}`)")
+        st.table(
+            pd.DataFrame(
+                {
+                    "필터": [label for _, label in _NL_FILTER_LABELS],
+                    "값": [_nl_filter_display(k, filters.get(k)) for k, _ in _NL_FILTER_LABELS],
+                }
+            )
+        )
+
+        try:
+            nl_df = archive_db.Archive().search(
+                block=filters.get("block") or "",
+                weld_id=filters.get("weld_id") or "",
+                defect_type=filters.get("defect_type") or "",
+                passed=filters.get("passed"),
+                text=filters.get("text") or "",
+                date_from=filters.get("date_from") or "",
+                date_to=filters.get("date_to") or "",
+            )
+        except Exception as exc:
+            st.error(f"아카이브 검색에 실패했습니다: {exc}")
+            return
+
+        st.caption(f"검색 결과: {len(nl_df)}건")
+        if nl_df.empty:
+            st.info("조건에 맞는 기록이 없습니다.")
+            return
+        st.dataframe(nl_df, width="stretch", hide_index=True)
+        st.download_button(
+            "검색 결과 CSV 다운로드",
+            data=nl_df.to_csv(index=False).encode("utf-8-sig"),  # utf-8-sig: 엑셀 한글 호환
+            file_name=f"rt_archive_nl_{datetime.now():%Y%m%d_%H%M%S}.csv",
+            mime="text/csv",
+            key="wb_btn_nl_csv",
+        )
+        _render_history_summary(nl_df, key="wb_btn_nl_summary", question=nl_q or "")
+
+
 def render_tab_archive() -> None:
     st.subheader("아카이브 검색")
     st.caption("🔎 '3번 블록 기공 이력'을 3초 안에 — 승인 기록은 전부 검색 가능한 자산입니다.")
+
+    _render_nl_search()
 
     with st.form("wb_search_form"):
         c1, c2, c3 = st.columns(3)
@@ -964,6 +1112,7 @@ def render_tab_archive() -> None:
         key="wb_btn_csv",
         help="선주·선급 요청 대응용 — 현재 필터의 검색 결과를 엑셀에서 열리는 CSV로 저장합니다.",
     )
+    _render_history_summary(df, key="wb_btn_form_summary", question=f_text or "")
 
     st.markdown("**상세 보기**")
     rid = st.selectbox("record_id 선택", list(df["record_id"]), key="wb_detail_rid")
@@ -985,7 +1134,7 @@ def render_tab_archive() -> None:
                     "판독원", "기법", "스케일(mm/px)", "이미지", "승인 일시", "초안 경로",
                     "판독 소요시간"],
             "값": [ctx.film_id, ctx.block, ctx.weld_id, ctx.joint_type,
-                   ctx.thickness_mm, ctx.quality_level, ctx.inspector, ctx.technique,
+                   f"{ctx.thickness_mm:g}", ctx.quality_level, ctx.inspector, ctx.technique,
                    f"{ctx.scale_mm_per_px:.4f}" if ctx.scale_mm_per_px else "미확정",
                    rec.image_name, rec.created_at, rec.report_source,
                    f"{rec.elapsed_seconds / 60:.1f}분" if rec.elapsed_seconds else "기록 없음"],
@@ -1147,6 +1296,39 @@ def render_tab_info() -> None:
     )
 
     st.divider()
+    st.subheader("LLM 정책")
+    st.caption(
+        "기본 정책: 로컬 LLM 또는 오프라인 템플릿. "
+        "외부 클라우드 API는 RTWB_ALLOW_CLOUD_LLM=1 로 명시 허용 시에만 사용"
+    )
+    try:
+        from rtworkbench import report_llm  # 지연 import — 병렬 구현 모듈
+
+        pol = report_llm.llm_policy_status()
+    except Exception as exc:
+        st.error(f"LLM 정책 상태 조회에 실패했습니다: {exc}")
+    else:
+        reach = pol.get("local_reachable")
+        st.table(
+            pd.DataFrame(
+                {
+                    "항목": ["외부 클라우드 LLM", "로컬 LLM URL", "로컬 모델", "로컬 LLM 연결",
+                           "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "실제 폴백 순서"],
+                    "값": [
+                        "허용 (RTWB_ALLOW_CLOUD_LLM=1)" if pol.get("cloud_allowed") else "차단 (기본)",
+                        pol.get("local_url") or "(미설정)",
+                        pol.get("local_model") or "-",
+                        "미설정" if reach is None
+                        else ("🟢 연결됨" if reach else "🔴 연결 안 됨 → 오프라인 템플릿 폴백"),
+                        "설정됨" if pol.get("anthropic_key") else "없음",
+                        "설정됨" if pol.get("gemini_key") else "없음",
+                        " → ".join(pol.get("effective_order", [])),
+                    ],
+                }
+            )
+        )
+
+    st.divider()
     st.caption(f"RT 판독 워크벤치 v{__version__} — \"판독은 자격자가, 서류는 AI가.\"")
 
 
@@ -1176,6 +1358,18 @@ def render_sidebar() -> InspectionContext:
             key="wb_ctx_quality", on_change=invalidate_judgment,
         )
         st.text_input("판독원", key="wb_ctx_inspector", placeholder="성명/자격번호")
+        # 그룹 판정(누적 길이·투영 면적률)의 기준 구간 — 바뀌면 기존 판정을 무효화한다
+        st.markdown("**그룹 판정 기준 구간**")
+        st.number_input(
+            "평가 길이 (mm)", min_value=1.0, max_value=5000.0, value=100.0, step=10.0,
+            key="wb_ctx_eval_len", on_change=invalidate_judgment,
+            help="누적 길이·투영 면적률 판정의 기준 길이 (기준표의 평가 구간)",
+        )
+        st.number_input(
+            "용접부 폭 (mm)", min_value=1.0, max_value=500.0, value=20.0, step=1.0,
+            key="wb_ctx_weld_w", on_change=invalidate_judgment,
+            help="투영 면적률 = Σ원 근사 면적 ÷ (평가 길이 × 용접부 폭)",
+        )
 
         st.divider()
         st.markdown("**탐지 백엔드**")

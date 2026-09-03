@@ -24,11 +24,30 @@ class RuleEngine:
           → 허용 한계 2.4mm, 측정값 3.1mm 초과 → 불합격").'''
 
     def evaluate_all(self, items: list[tuple[str, str, float]],
-                     thickness_mm: float, quality_level: str) -> list[RuleVerdict]:
-        '''items = [(defect_id, defect_type, size_mm), ...] 일괄 판정.'''
+                     thickness_mm: float, quality_level: str, *,
+                     eval_length_mm: float = 100.0,
+                     weld_width_mm: float = 20.0) -> list[RuleVerdict]:
+        '''items = [(defect_id, defect_type, size_mm), ...] 일괄 판정.
+        단일 verdict(입력 순서 보존) 뒤에, 기준표에 "group" 블록이 있는 유형마다
+        그룹 verdict 1건(defect_id="GROUP:<type>", 유형 최초 등장 순)을 덧붙인다.
+        eval_length_mm/weld_width_mm <= 0 → ValueError.'''
+
+    def evaluate_group(self, defect_type: str, sizes: list[float],
+                       thickness_mm: float, quality_level: str, *,
+                       eval_length_mm: float = 100.0,
+                       weld_width_mm: float = 20.0) -> RuleVerdict | None:
+        '''유형별 그룹 판정 1건. 기준표에 group 블록이 없는 유형(또는 sizes 비어 있음)이면 None.
+        - mode="cumulative_length": 합계 = Σ size_mm (평가 길이 내 누적 길이) [mm],
+          limit = min(coef_thickness×t, cap_mm) — 단일 규칙과 같은 형태. unit="mm"
+        - mode="area_ratio": 면적률 = Σ π·(d/2)² ÷ (eval_length_mm × weld_width_mm) × 100 [%]
+          (d = 측정 최대 치수, 원 근사), limit = limit_pct. size_mm/limit_mm에 % 값 저장, unit="%"
+        - permitted=false → limit_mm=None, passed=False'''
 
 def overall_pass(verdicts: list[RuleVerdict]) -> bool:
-    '''전체 합부: 모든 verdict가 passed일 때만 True. 빈 목록은 True(결함 없음).'''
+    '''전체 합부: 모든 verdict(그룹 verdict 포함)가 passed일 때만 True. 빈 목록은 True(결함 없음).'''
+
+def is_group_verdict(v: RuleVerdict) -> bool:
+    '''defect_id가 "GROUP:"으로 시작하는 그룹 판정 행 여부.'''
 
 ────────────────────────────────────────────────────────────────────
 반올림/경계 판정 정책 (부동소수 오차와 모순되지 않도록 고정):
@@ -45,21 +64,35 @@ def overall_pass(verdicts: list[RuleVerdict]) -> bool:
      — 저장된 (size_mm, limit_mm, passed) 세 값만 보고도
        passed == (size_mm <= limit_mm)가 항상 성립한다(자기모순 없는 기록).
      0.01mm(=10μm)는 필름 스캔 측정의 물리적 정밀도보다 충분히 촘촘하다.
+  4) 그룹 판정도 같은 정책을 따른다: 누적 길이는 round(Σ round(size, 2), 2),
+     면적률은 round(ratio_pct, 2)를 round(limit_pct, 2)와 비교. 경계 동치는 합격.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 from rtworkbench import config
-from rtworkbench.models import QUALITY_LEVELS, RuleVerdict
+from rtworkbench.models import DEFECT_TYPES, GROUP_ID_PREFIX, QUALITY_LEVELS, RuleVerdict
+
+# 기준표 group.mode 허용값
+GROUP_MODES: tuple[str, ...] = ("cumulative_length", "area_ratio")
 
 
 def _fmt_mm(x: float) -> str:
     """mm 수치 표기: 소수 최대 2자리, 최소 1자리 (2.40→'2.4', 3.00→'3.0', 2.41→'2.41')."""
     s = f"{x:.2f}"
     return s[:-1] if s.endswith("0") else s
+
+
+def _check_eval_window(eval_length_mm: float, weld_width_mm: float) -> None:
+    """그룹 판정 기준 구간(평가 길이 × 용접부 폭) 검증 — 0 이하는 거부."""
+    if eval_length_mm <= 0:
+        raise ValueError(f"평가 길이(eval_length_mm)는 0보다 커야 합니다: {eval_length_mm}")
+    if weld_width_mm <= 0:
+        raise ValueError(f"용접부 폭(weld_width_mm)은 0보다 커야 합니다: {weld_width_mm}")
 
 
 class RuleEngine:
@@ -140,6 +173,58 @@ class RuleEngine:
                                 f"기준표 형식 오류: '{dtype}' 등급 '{lv}'의 '{k}'가 "
                                 f"숫자가 아닙니다 — {path}"
                             )
+            if "group" in rule:
+                RuleEngine._validate_group(dtype, rule["group"], quality_levels, path)
+
+    @staticmethod
+    def _validate_group(
+        dtype: str, group: object, quality_levels: tuple[str, ...], path: Path
+    ) -> None:
+        """선택 블록 'group'(유형별 그룹 판정) 구조 검증 — 로드 시점 ValueError로 거부.
+
+        group = {mode: 'cumulative_length'|'area_ratio', clause: str, name_ko?: str,
+                 levels: {등급: {permitted?: bool, coef_thickness/cap_mm | limit_pct}}}
+        permitted가 없으면 허용(true)으로 간주하고, 허용 등급은 mode별 한계 수치가 필수다.
+        """
+        if not isinstance(group, dict):
+            raise ValueError(
+                f"기준표 형식 오류: '{dtype}' group이 객체(dict)가 아닙니다 — {path}"
+            )
+        mode = group.get("mode")
+        if mode not in GROUP_MODES:
+            raise ValueError(
+                f"기준표 형식 오류: '{dtype}' group.mode는 {'/'.join(GROUP_MODES)} 중 "
+                f"하나여야 합니다: {mode!r} — {path}"
+            )
+        if not isinstance(group.get("clause"), str):
+            raise ValueError(
+                f"기준표 형식 오류: '{dtype}' group에 문자열 clause가 없습니다 — {path}"
+            )
+        levels = group.get("levels")
+        if not isinstance(levels, dict):
+            raise ValueError(
+                f"기준표 형식 오류: '{dtype}' group에 levels가 없습니다 — {path}"
+            )
+        missing = [lv for lv in quality_levels if lv not in levels]
+        if missing:
+            raise ValueError(
+                f"기준표 형식 오류: '{dtype}' group.levels에 선언된 품질등급 "
+                f"{'/'.join(missing)} 항목이 없습니다 — {path}"
+            )
+        required = ("limit_pct",) if mode == "area_ratio" else ("coef_thickness", "cap_mm")
+        for lv, entry in levels.items():
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"기준표 형식 오류: '{dtype}' group 등급 '{lv}'이 객체(dict)가 아닙니다 — {path}"
+                )
+            if not entry.get("permitted", True):
+                continue  # 불허 등급은 한계 수치 불필요
+            for k in required:
+                if not isinstance(entry.get(k), (int, float)):
+                    raise ValueError(
+                        f"기준표 형식 오류: '{dtype}' group 등급 '{lv}'의 '{k}'가 "
+                        f"숫자가 아닙니다 — {path}"
+                    )
 
     @property
     def meta(self) -> dict:
@@ -156,15 +241,7 @@ class RuleEngine:
     ) -> RuleVerdict:
         """단일 결함 합부 판정 (결정론적 — 같은 입력이면 항상 같은 출력)."""
         # ── 입력 검증 (fail-safe 경로라도 입력이 틀리면 판정 자체를 거부한다) ──
-        if quality_level not in self._quality_levels:
-            raise ValueError(
-                f"품질등급은 {'/'.join(self._quality_levels)} 중 하나여야 합니다: "
-                f"'{quality_level}'"
-            )
-        if size_mm < 0:
-            raise ValueError(f"측정 크기(size_mm)는 0 이상이어야 합니다: {size_mm}")
-        if thickness_mm <= 0:
-            raise ValueError(f"모재 두께(thickness_mm)는 0보다 커야 합니다: {thickness_mm}")
+        self._check_inputs(thickness_mm, quality_level, [size_mm])
 
         # 반올림 정책 (모듈 docstring 참조): 측정값을 0.01mm 단위로 정렬해 저장/비교
         size_r = round(size_mm, 2)
@@ -235,19 +312,145 @@ class RuleEngine:
             detail=detail,
         )
 
+    def _check_inputs(
+        self, thickness_mm: float, quality_level: str, sizes: list[float]
+    ) -> None:
+        """공통 입력 검증 — 품질등급 / 측정 크기 / 모재 두께 (검사 순서 고정)."""
+        if quality_level not in self._quality_levels:
+            raise ValueError(
+                f"품질등급은 {'/'.join(self._quality_levels)} 중 하나여야 합니다: "
+                f"'{quality_level}'"
+            )
+        for size_mm in sizes:
+            if size_mm < 0:
+                raise ValueError(f"측정 크기(size_mm)는 0 이상이어야 합니다: {size_mm}")
+        if thickness_mm <= 0:
+            raise ValueError(f"모재 두께(thickness_mm)는 0보다 커야 합니다: {thickness_mm}")
+
+    def evaluate_group(
+        self,
+        defect_type: str,
+        sizes: list[float],
+        thickness_mm: float,
+        quality_level: str,
+        *,
+        eval_length_mm: float = 100.0,
+        weld_width_mm: float = 20.0,
+    ) -> RuleVerdict | None:
+        """유형별 그룹 판정 (결정론적). group 블록이 없는 유형이면 None.
+
+        - cumulative_length: 평가 길이 내 같은 유형의 측정 길이 합 vs min(coef×t, cap) [mm]
+        - area_ratio: Σπ(d/2)² ÷ (평가 길이 × 용접부 폭) × 100 vs limit_pct [%]
+          (size_mm/limit_mm에 % 값을 저장하고 unit="%"로 단위를 명시)
+        """
+        self._check_inputs(thickness_mm, quality_level, sizes)
+        _check_eval_window(eval_length_mm, weld_width_mm)
+        if not sizes:
+            return None
+        rule = self._data["rules"].get(defect_type)
+        group = rule.get("group") if isinstance(rule, dict) else None
+        if group is None:
+            return None
+
+        mode = group["mode"]
+        gname = group.get("name_ko", f"{defect_type} {mode}")
+        type_ko = DEFECT_TYPES.get(defect_type, defect_type)
+        level = group["levels"][quality_level]
+        sizes_r = [round(s, 2) for s in sizes]  # 정책 2)/4): 단일 판정과 같은 자릿수로 정렬
+        n = len(sizes_r)
+        common = dict(
+            defect_id=f"{GROUP_ID_PREFIX}{defect_type}",
+            defect_type=defect_type,
+            quality_level=quality_level,
+            thickness_mm=thickness_mm,
+            clause=group["clause"],
+        )
+
+        if mode == "area_ratio":
+            area_sum = sum(math.pi * (d / 2.0) ** 2 for d in sizes_r)  # 원 근사 투영 면적
+            ratio = area_sum / (eval_length_mm * weld_width_mm) * 100.0
+            value = round(ratio, 2)
+            basis = (
+                f"{type_ko} {n}건 원 근사 면적 합 {_fmt_mm(area_sum)}mm² ÷ "
+                f"(평가길이 {eval_length_mm:g}mm × 용접부 폭 {weld_width_mm:g}mm) "
+                f"= {_fmt_mm(value)}%"
+            )
+            if not level.get("permitted", True):
+                return RuleVerdict(
+                    **common, size_mm=value, limit_mm=None, passed=False, unit="%",
+                    detail=f"품질등급 {quality_level}에서 {gname}은(는) 허용되지 않음 ({basis}) → 불합격",
+                )
+            limit = round(float(level["limit_pct"]), 2)  # 정책 1) 한계 먼저 확정
+            passed = value <= limit
+            detail = (
+                f"품질등급 {quality_level} · {gname}: {basis} "
+                f"{'≤' if passed else '>'} 한계 {_fmt_mm(limit)}% → {'합격' if passed else '불합격'}"
+            )
+            return RuleVerdict(
+                **common, size_mm=value, limit_mm=limit, passed=passed, unit="%", detail=detail
+            )
+
+        # ── cumulative_length: 평가 길이 내 누적 길이 vs min(coef×t, cap) ──
+        total = round(sum(sizes_r), 2)
+        terms = " + ".join(_fmt_mm(s) for s in sizes_r)
+        basis = f"{type_ko} {n}건 길이 합 ({terms}) = {_fmt_mm(total)}mm"
+        if not level.get("permitted", True):
+            return RuleVerdict(
+                **common, size_mm=total, limit_mm=None, passed=False, unit="mm",
+                detail=f"품질등급 {quality_level}에서 {gname}은(는) 허용되지 않음 ({basis}) → 불합격",
+            )
+        coef = level["coef_thickness"]
+        cap = level["cap_mm"]
+        by_thickness = coef * thickness_mm
+        limit = round(min(by_thickness, cap), 2)
+        passed = total <= limit
+        detail = (
+            f"품질등급 {quality_level} · {gname}: {basis}; "
+            f"두께 {_fmt_mm(thickness_mm)}mm × 계수 {coef} = {_fmt_mm(by_thickness)}mm, "
+            f"cap {_fmt_mm(cap)}mm → 허용 한계 {_fmt_mm(limit)}mm (평가길이 {eval_length_mm:g}mm 기준); "
+            f"누적 {_fmt_mm(total)}mm {'≤' if passed else '>'} 한계 → {'합격' if passed else '불합격'}"
+        )
+        return RuleVerdict(
+            **common, size_mm=total, limit_mm=limit, passed=passed, unit="mm", detail=detail
+        )
+
     def evaluate_all(
         self,
         items: list[tuple[str, str, float]],
         thickness_mm: float,
         quality_level: str,
+        *,
+        eval_length_mm: float = 100.0,
+        weld_width_mm: float = 20.0,
     ) -> list[RuleVerdict]:
-        """items = [(defect_id, defect_type, size_mm), ...] 일괄 판정 (입력 순서 보존)."""
-        return [
+        """items = [(defect_id, defect_type, size_mm), ...] 일괄 판정 (입력 순서 보존).
+
+        단일 verdict 뒤에, group 블록이 있는 유형마다 그룹 verdict 1건을
+        유형의 최초 등장 순서로 덧붙인다. 3인자 호출은 기본 평가 구간(100mm × 20mm)을 쓴다.
+        """
+        _check_eval_window(eval_length_mm, weld_width_mm)
+        verdicts = [
             self.evaluate(defect_id, defect_type, size_mm, thickness_mm, quality_level)
             for defect_id, defect_type, size_mm in items
         ]
+        sizes_by_type: dict[str, list[float]] = {}
+        for _defect_id, defect_type, size_mm in items:
+            sizes_by_type.setdefault(defect_type, []).append(size_mm)
+        for defect_type, sizes in sizes_by_type.items():
+            gv = self.evaluate_group(
+                defect_type, sizes, thickness_mm, quality_level,
+                eval_length_mm=eval_length_mm, weld_width_mm=weld_width_mm,
+            )
+            if gv is not None:
+                verdicts.append(gv)
+        return verdicts
 
 
 def overall_pass(verdicts: list[RuleVerdict]) -> bool:
-    """전체 합부: 모든 verdict가 passed일 때만 True. 빈 목록은 True(결함 없음)."""
+    """전체 합부: 모든 verdict(그룹 verdict 포함)가 passed일 때만 True. 빈 목록은 True(결함 없음)."""
     return all(v.passed for v in verdicts)
+
+
+def is_group_verdict(v: RuleVerdict) -> bool:
+    """defect_id가 "GROUP:"으로 시작하는 그룹 판정(누적 길이·투영 면적률) 행 여부."""
+    return v.is_group

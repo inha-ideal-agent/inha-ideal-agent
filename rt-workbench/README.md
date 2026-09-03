@@ -20,8 +20,8 @@
 | # | 기능 | 구현 |
 |---|---|---|
 | 1 | **2차 눈 (Second Reader)** — 판독원이 먼저 보고, AI가 놓침 방지 후보 표시. recall 우선(오탐은 클릭 한 번, 미탐은 배에 남는다) | `rtworkbench/detection.py` — YOLO 백엔드(가중치 있을 때) + OpenCV 폴백 탐지기(항상 동작) |
-| 2 | **2클릭 자 + 룰 판정** — 판독원이 IQI/납마커 기준 2클릭으로 스케일 확정, 결함 크기도 2클릭 확정 → 룰 엔진이 기준표 대조 합부+조항 제시 | `rtworkbench/measure.py` + `rtworkbench/rules.py` + `criteria/demo_iso5817_like.json` |
-| 3 | **소견서 초안 자동 생성** — 확정된 판정 결과(비식별 텍스트만)를 LLM이 리포트 문체로 작성 → 판독원 수정·승인 → PDF | `rtworkbench/report_llm.py` (Claude→Gemini→오프라인 템플릿 폴백 + 응답 캐시) + `rtworkbench/report_pdf.py` |
+| 2 | **2클릭 자 + 룰 판정** — 판독원이 IQI/납마커 기준 2클릭으로 스케일 확정, 결함 크기도 2클릭 확정 → 룰 엔진이 기준표 대조 합부+조항 제시. 판정식 3종: **단일 치수** `min(계수×t, cap)` / **누적 길이** (평가 길이 내 같은 유형의 길이 합) / **투영 면적률** (Σ원 근사 면적 ÷ (평가 길이 × 용접부 폭), %) — 뒤의 둘은 유형별 `합계(...)` 행으로 추가되며, 사이드바의 **평가 길이·용접부 폭** 입력이 기준 구간 | `rtworkbench/measure.py` + `rtworkbench/rules.py` + `criteria/demo_iso5817_like.json` |
+| 3 | **소견서 초안 자동 생성** — 확정된 판정 결과(비식별 텍스트만)를 LLM이 리포트 문체로 작성 → 판독원 수정·승인 → PDF | `rtworkbench/report_llm.py` (로컬 LLM→[명시 허용 시 Claude→Gemini]→오프라인 템플릿 폴백 + 응답 캐시) + `rtworkbench/report_pdf.py` |
 | 4 | **검색 아카이브 + 자기개선 루프** — 승인 기록 DB 축적, "3번 블록 기공 이력" 3초 검색, 승인 기록 = YOLO 라벨 데이터 export | `rtworkbench/db.py` (SQLite) |
 
 ## 실행
@@ -50,8 +50,35 @@ python3 scripts/generate_samples.py
 streamlit run app.py
 ```
 
-LLM API 키는 **없어도 전부 동작**합니다(오프라인 템플릿 백엔드).
-있으면 자동 사용: `ANTHROPIC_API_KEY`(1순위), `GEMINI_API_KEY`(2순위 폴백).
+### LLM 정책 — 로컬 우선 (local-first)
+
+조선소/NDT 현장은 검사 텍스트의 외부 반출이 기본 금지입니다. 따라서 **기본 정책은
+로컬 LLM 또는 오프라인 템플릿**이며, 외부 클라우드 API는 명시 허용 시에만 사용합니다.
+LLM이 하나도 없어도 **전부 동작**합니다(오프라인 템플릿 백엔드).
+
+폴백 순서: 캐시 → 로컬 LLM → *(RTWB_ALLOW_CLOUD_LLM=1 일 때만)* Claude → Gemini → 오프라인 템플릿
+
+| 환경변수 | 기본값 | 의미 |
+|---|---|---|
+| `RTWB_LOCAL_LLM_URL` | `http://localhost:11434/v1` | OpenAI 호환 base URL (Ollama/vLLM 등) |
+| `RTWB_LOCAL_LLM_MODEL` | `exaone3.5:7.8b` | 로컬 모델명 |
+| `RTWB_ALLOW_CLOUD_LLM` | `0` (차단) | `1` 로 설정할 때만 외부 클라우드 API 사용 — 키가 있어도 이 값이 없으면 호출하지 않음 |
+| `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` | (없음) | 클라우드 허용 시 사용 (Claude 1순위, Gemini 2순위) |
+
+```bash
+# 로컬 LLM 예시 (Ollama)
+ollama pull exaone3.5:7.8b && ollama serve   # 기본 URL http://localhost:11434/v1
+```
+
+현재 정책·연결 상태는 앱의 **📖 기준표·정보 → LLM 정책** 표에서 확인할 수 있습니다.
+
+**LLM 고유 기능** (템플릿이 대체할 수 없는 것 — 단, LLM은 어느 경우에도 판정하지 않음):
+
+- **🗣️ 자연어로 찾기** (아카이브 탭): "3번 블록에서 지난달 기공으로 불합격한 건" → LLM이
+  검색 **필터만** JSON으로 추출(블록/용접부/결함 유형/합부/기간) → 검색은 결정론적 DB 조회.
+  LLM 불가 시 규칙 파서(`rule`)로 폴백 — 상대 날짜(어제/이번 주/지난달/최근 N일/YYYY년 M월) 인식.
+- **AI 이력 요약** (아카이브 탭): 검색 결과(최대 60건)의 비식별 집계를 판독원용 한국어 요약으로
+  (유형별 건수, 합부 비율, 반복 블록·용접부, 주요 불합격 항목+조항). LLM 불가 시 통계 템플릿.
 
 ```bash
 # 헤드리스 E2E 데모 (탐지→캘리브레이션→측정→판정→소견서→PDF→DB→검색→라벨 export)
@@ -79,7 +106,7 @@ python3 -m pytest tests/ -q
 2. **2차 눈**: "AI 후보 탐지" → 주황 박스 후보 → 오탐은 [기각] 클릭 한 번, 실결함은 [채택]
 3. **캘리브레이션**: 클릭 모드 '캘리브레이션' → 납마커 양 끝 2클릭 + 실길이 10mm 입력 → mm/px 확정
 4. **측정**: 클릭 모드 '결함 측정' → 후보 선택 → 결함 양 끝 2클릭 → mm 확정
-5. **판정**: "판정 실행" → 결함별 허용 한계·조항·합부 + 종합 판정 배너 (룰 엔진, AI 아님)
+5. **판정**: "판정 실행" → 결함별 허용 한계·조항·합부 + 유형별 합계 행(누적 길이·투영 면적률) + 종합 판정 배너 (룰 엔진, AI 아님)
 6. **소견서**: "초안 생성" → 편집 → **승인** → PDF 다운로드 + 아카이브 저장
 7. **아카이브 탭**: "3번 블록" 검색 → 과거 이력 즉시 조회
 8. **자기개선 탭**: AI 채택률·미탐(사람 추가) 지표 확인 → YOLO 라벨 export
@@ -91,8 +118,8 @@ app.py (Streamlit UI — 탭: 판독 워크벤치 / 아카이브 검색 / 자기
  ├─ preprocess.py   CLAHE 전처리
  ├─ detection.py    2차 눈: YoloDetector(옵션) / CVFallbackDetector(기본)
  ├─ measure.py      2클릭 자: 캘리브레이션(mm/px)·거리 측정   ← 사람이 확정
- ├─ rules.py        결정론적 룰 엔진 ← criteria/*.json (데이터 주도, 교체 가능)
- ├─ report_llm.py   소견서 초안: 비식별 payload → Claude→Gemini→템플릿 폴백 (+캐시)
+ ├─ rules.py        결정론적 룰 엔진 ← criteria/*.json (단일 치수·누적 길이·투영 면적률, 데이터 주도·교체 가능)
+ ├─ report_llm.py   소견서 초안·자연어 검색 필터·이력 요약: 비식별 payload → 로컬 LLM→[클라우드]→템플릿 (+캐시)
  ├─ report_pdf.py   승인 소견서 PDF (reportlab, 한글 CID 폰트)
  ├─ db.py           SQLite 아카이브: 저장/검색/통계/YOLO 라벨 export
  └─ models.py       공용 데이터 모델 (전 모듈의 계약)
@@ -103,7 +130,9 @@ app.py (Streamlit UI — 탭: 판독 워크벤치 / 아카이브 검색 / 자기
 - LLM에는 **이미지를 보내지 않는다**. `build_payload()`가 만든 비식별 판정 결과 텍스트만 전송
   (검사원 실명·파일 경로 제외). 전송 내용은 UI에서 미리보기 가능.
 - 오프라인 모드: API 응답 사전 캐시 + 결정론적 템플릿 백엔드로 네트워크 없이 시연 가능.
-- 로드맵: 온프레미스/로컬 모델 전환.
+- **로컬 우선 LLM 정책**: 기본은 온프레미스 로컬 LLM(OpenAI 호환) 또는 템플릿.
+  외부 클라우드 API는 `RTWB_ALLOW_CLOUD_LLM=1` 로 명시 허용해야만 호출 — 키가 있어도 기본 차단.
+- 자연어 검색에서 LLM은 **필터 추출만** 담당 — 검색·판정은 결정론적 코드가 수행.
 
 ## 주의 (데모 한계)
 

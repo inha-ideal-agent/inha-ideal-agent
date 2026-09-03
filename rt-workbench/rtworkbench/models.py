@@ -33,6 +33,9 @@ QUALITY_LEVELS: tuple[str, ...] = ("B", "C", "D")  # ISO 5817 계열: B(엄격) 
 
 CANDIDATE_STATUS = ("proposed", "accepted", "rejected")  # AI 제안 / 판독원 채택 / 기각
 
+# 그룹 판정(누적 길이·투영 면적률) verdict의 defect_id 접두어 — "GROUP:<defect_type>"
+GROUP_ID_PREFIX = "GROUP:"
+
 
 def new_id(prefix: str = "df") -> str:
     """짧은 고유 ID 생성 (UI 표시용)."""
@@ -102,13 +105,28 @@ class RuleVerdict:
     passed: bool
     clause: str  # 근거 조항 표기 (데모 기준표의 항목 ID)
     detail: str  # 판정 근거 설명 (한국어, 룰 엔진이 결정론적으로 생성)
+    unit: str = "mm"  # size_mm/limit_mm의 단위: 'mm' | '%'(투영 면적률 그룹 판정)
+
+    @property
+    def is_group(self) -> bool:
+        """그룹 판정(유형별 누적 길이·투영 면적률) 행 여부."""
+        return self.defect_id.startswith(GROUP_ID_PREFIX)
+
+    @property
+    def type_ko(self) -> str:
+        return DEFECT_TYPES.get(self.defect_type, self.defect_type)
+
+    @property
+    def display_id(self) -> str:
+        """표시용 ID — 그룹 판정은 '합계(기공)' 형태, 단일 판정은 defect_id 그대로."""
+        return f"합계({self.type_ko})" if self.is_group else self.defect_id
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "RuleVerdict":
-        return cls(**d)
+        return cls(**d)  # 구버전 기록에 unit이 없으면 기본값 'mm'
 
 
 @dataclass
@@ -125,13 +143,15 @@ class InspectionContext:
     technique: str = "RT (필름 스캔)"
     scale_mm_per_px: float | None = None  # 2클릭 캘리브레이션 결과
     scale_ref: str = ""  # 캘리브레이션 기준물 (예: "납마커 10mm")
+    eval_length_mm: float = 100.0  # 평가 길이 — 누적 길이·면적률 그룹 판정의 기준 구간
+    weld_width_mm: float = 20.0  # 용접부 폭 — 투영 면적(평가 길이 × 폭) 산정용
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "InspectionContext":
-        return cls(**d)
+        return cls(**d)  # 구버전 기록에 eval_length_mm/weld_width_mm가 없으면 기본값
 
 
 @dataclass
