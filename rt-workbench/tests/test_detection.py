@@ -172,3 +172,24 @@ def test_cv_fallback_detect_rejects_empty_input():
     for shape in [(0, 10), (10, 0), (0, 0)]:
         with pytest.raises(ValueError):
             det.detect(np.zeros(shape, dtype=np.uint8))
+
+
+def test_min_confidence_default_suppresses_low_confidence_candidates():
+    """기본 운영점(MIN_CONFIDENCE=0.5): 저신뢰 후보는 제안되지 않고, 0.0 이면 더 많이 제안된다."""
+    import importlib.util, sys
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "generate_samples", Path(__file__).resolve().parent.parent / "scripts" / "generate_samples.py"
+    )
+    gen = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gen)
+    from rtworkbench.detection import CVFallbackDetector
+
+    img, gt = gen.generate_film(seed=1, defects_spec=[])  # 무결함 필름
+    det = CVFallbackDetector()
+    default_cands = det.detect(img)
+    all_cands = det.detect(img, min_confidence=0.0)
+    assert all(c.confidence >= det.MIN_CONFIDENCE for c in default_cands)
+    assert len(default_cands) <= len(all_cands)
+    assert len(all_cands) == 30  # 필터 없이는 상위 N 을 채운다
+    assert len(default_cands) < 30  # 무결함 필름에서 저신뢰 후보가 걸러진다

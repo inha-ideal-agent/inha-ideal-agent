@@ -61,8 +61,10 @@ class CVFallbackDetector:
       → 느슨한 임계(recall 우선) → 모폴로지 연결 → 연결 성분 분석
       → 컨투어 기하(원형도/종횡비/두께/대비)로 유형 추정 → 휴리스틱 confidence.
 
-    recall 우선 설계: 임계는 느슨하게 잡고, 대신 confidence 순으로
-    상위 max_candidates 만 제안한다. 면적 6px 미만의 노이즈는 제외.
+    recall 우선 설계: 임계는 느슨하게 잡고, confidence 순으로 상위 max_candidates 만
+    제안하되, MIN_CONFIDENCE 미만의 저신뢰 후보는 제안하지 않는다(합성 필름 6장 실측:
+    임계 0.5 에서 재현율 14/14, 장당 오탐 3.8건 — 임계 없이는 장당 오탐 27.7건).
+    면적 6px 미만의 노이즈는 제외.
     """
 
     name = "cv-fallback"
@@ -73,8 +75,15 @@ class CVFallbackDetector:
     DENOISE_SIGMA = 1.1  # 임계 전 가우시안 디노이즈
     THRESH_FLOOR = 8.0  # 임계 하한(느슨하게 — recall 우선)
     THRESH_SIGMA = 2.0  # 임계 = max(floor, mean + sigma*std)
+    MIN_CONFIDENCE = 0.5  # 이 미만의 후보는 제안하지 않음 (recall 유지 + 오탐 억제 운영점)
 
-    def detect(self, img_gray: np.ndarray, max_candidates: int = 30) -> list[DefectCandidate]:
+    def detect(
+        self,
+        img_gray: np.ndarray,
+        max_candidates: int = 30,
+        min_confidence: float | None = None,
+    ) -> list[DefectCandidate]:
+        """min_confidence: None 이면 MIN_CONFIDENCE, 0.0 이면 필터 없이 상위 N 제안."""
         if not isinstance(img_gray, np.ndarray) or img_gray.ndim != 2 or img_gray.size == 0:
             raise ValueError("detect 입력은 크기 0이 아닌 2차원 그레이스케일 ndarray 여야 합니다.")
         if img_gray.dtype != np.uint8:
@@ -136,7 +145,9 @@ class CVFallbackDetector:
             )
             scored.append((conf * 1000.0 + math.sqrt(area), cand))
 
-        # 6) 점수 순 상위 N 컷 (recall 우선이되 후보 폭주는 방지)
+        # 6) 저신뢰 후보 제거 후 점수 순 상위 N 컷 (recall 우선이되 후보 폭주는 방지)
+        min_conf = self.MIN_CONFIDENCE if min_confidence is None else float(min_confidence)
+        scored = [t for t in scored if t[1].confidence >= min_conf]
         scored.sort(key=lambda t: t[0], reverse=True)
         return [c for _, c in scored[: max(0, int(max_candidates))]]
 
