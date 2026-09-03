@@ -4,7 +4,8 @@
 
 3대 설계 원칙:
   1. AI는 판정하지 않는다 — 합부는 결정론적 룰 엔진 + 판독원, LLM은 설명/작문 전담.
-  2. 새 행동 요구 0 — 입력은 기존 필름 스캔 이미지 그대로.
+  2. 기존 이미지·기존 절차 위에 — 입력은 스캔된 필름 이미지 또는 디지털 RT(CR/DR) 이미지.
+     (필름 디지털화는 조직 단위 전제조건: ISO 14096-2 등급 디지타이저 또는 스캔 서비스)
   3. 탐지는 부품 — recall(민감도) 우선, 오탐은 클릭 한 번·미탐은 배에 남는다.
 
 실행: streamlit run app.py  (프로젝트 루트에서)
@@ -58,16 +59,17 @@ COLOR_HUMAN = (60, 120, 255)  # 파랑 — 판독원 직접 추가
 COLOR_MEASURE = (0, 220, 120)  # 초록 — 측정선
 COLOR_CLICK = (255, 0, 255)  # 마젠타 — 진행 중 클릭 십자
 
-PRINCIPLES_SHORT = "원칙: ① AI는 판정하지 않는다 ② 새 행동 요구 0 ③ 탐지는 부품(recall 우선)"
+PRINCIPLES_SHORT = "원칙: ① AI는 판정하지 않는다 ② 기존 이미지·절차 위에 ③ 탐지는 부품(recall 우선)"
 
 PRINCIPLES_FULL = """
 **1. AI는 판정하지 않는다.**
 합격/불합격은 결정론적 룰 엔진(기준표 JSON)과 자격 판독원이 결정한다.
 LLM은 이미 확정된 판정 결과를 공식 문체로 정리하는 작문 보조일 뿐이다.
 
-**2. 새 행동 요구 0.**
-현장에 새 장비·새 촬영 절차를 요구하지 않는다. 입력은 지금도 존재하는
-필름 스캔 이미지 파일 그대로다.
+**2. 기존 이미지·기존 절차 위에.**
+판독원 개인에게 새 장비·새 촬영 절차를 요구하지 않는다. 입력은 스캔된 필름
+이미지 또는 디지털 RT(CR/DR) 이미지이며, 필름 디지털화(ISO 14096-2 등급
+디지타이저 또는 스캔 서비스)는 조직 단위 전제조건으로 명시한다.
 
 **3. 탐지는 부품이다.**
 결함 후보 탐지기는 교체 가능한 부품이며 recall(민감도)을 우선한다.
@@ -217,9 +219,9 @@ def build_overlay_rgb(
     lt = max(2, int(round(w / DISPLAY_W * 2)))  # 표시 축소를 고려한 선 두께
     fs = max(0.45, w / DISPLAY_W * 0.55)  # 폰트 스케일
 
-    # 후보 박스 + ID
+    # 후보 박스 + 순번(#n) — 순번은 후보 목록 표의 순서와 같다
     if show_candidates:
-        for c in st.session_state["wb_candidates"]:
+        for n, c in enumerate(st.session_state["wb_candidates"], start=1):
             if _is_hidden_by_conf(c):
                 continue
             color = _candidate_color(c)
@@ -228,7 +230,7 @@ def build_overlay_rgb(
                 _draw_dashed_rect(rgb, (x1, y1), (x2, y2), color, max(1, lt - 1))
             else:
                 cv2.rectangle(rgb, (x1, y1), (x2, y2), color, lt)
-            label = c.id.split("-")[-1]  # 짧은 hex 부분만 표기
+            label = f"#{n}"
             ty = y1 - 6 if y1 - 6 > 12 else y2 + int(18 * fs)
             cv2.putText(rgb, label, (x1, ty), cv2.FONT_HERSHEY_SIMPLEX, fs, color, lt)
 
@@ -681,12 +683,13 @@ def _render_candidate_table() -> None:
         )
 
     header = st.columns([2, 3, 1.2, 1.2, 1.2, 1, 1])
-    for col, name in zip(header, ["ID", "유형", "신뢰도", "출처", "상태", "", ""]):
+    for col, name in zip(header, ["#순번 · ID", "유형", "신뢰도", "출처", "상태", "", ""]):
         col.markdown(f"**{name}**")
 
+    pos = {c.id: i for i, c in enumerate(cands, start=1)}  # 이미지 오버레이의 #n 과 동일
     for c in visible:
         row = st.columns([2, 3, 1.2, 1.2, 1.2, 1, 1])
-        row[0].code(c.id, language=None)
+        row[0].code(f"#{pos[c.id]} {c.id}", language=None)
         idx = TYPE_KEYS.index(c.defect_type) if c.defect_type in TYPE_KEYS else TYPE_KEYS.index("unknown")
         sel = row[1].selectbox(
             "유형", TYPE_KEYS, index=idx,
