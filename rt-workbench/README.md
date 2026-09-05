@@ -119,7 +119,8 @@ app.py (Streamlit UI — 탭: 판독 워크벤치 / 아카이브 검색 / 자기
  ├─ preprocess.py   CLAHE 전처리
  ├─ detection.py    2차 눈: YoloDetector(옵션) / CVFallbackDetector(기본)
  ├─ measure.py      2클릭 자: 캘리브레이션(mm/px)·거리 측정   ← 사람이 확정
- ├─ rules.py        결정론적 룰 엔진 ← criteria/*.json (단일 치수·누적 길이·투영 면적률, 데이터 주도·교체 가능)
+ ├─ rules.py        결정론적 룰 엔진 ← criteria/demo_iso5817_like.json (단일 치수·누적 길이·투영 면적률,
+ │                    데이터 주도·JSON 교체 가능 — 규격 판본별 JSON 분리는 로드맵)
  ├─ report_llm.py   소견서 초안·자연어 검색 필터·이력 요약: 비식별 payload → 로컬 LLM→[클라우드]→템플릿 (+캐시)
  ├─ report_pdf.py   승인 소견서 PDF (reportlab, 한글 CID 폰트)
  ├─ db.py           SQLite 아카이브: 저장/검색/통계/YOLO 라벨 export
@@ -141,6 +142,7 @@ app.py (Streamlit UI — 탭: 판독 워크벤치 / 아카이브 검색 / 자기
   규격 원문이 아닙니다. 실제 생산 검사 합부 기준은 선급 NDT 지침 확인·도메인 멘토링으로 확정 후
   JSON만 교체하면 됩니다 (룰 엔진 코드는 무변경 — 데이터 주도 설계).
 - CV 폴백 탐지기는 모델 가중치 없이 데모가 항상 동작하게 하는 안전망입니다.
-  실 성능은 AI Hub 용접 AI(71761)·RIAWELC 학습 YOLOv8s 가중치를 `weights/best.pt`에 두면
+  실 성능은 AI Hub 용접 AI(71761)·RIAWELC 학습 **YOLO26s**(Ultralytics YOLO, 2026.01 공개 — YOLOv8/11 가중치도
+  같은 API) 가중치를 `weights/best.pt`에 두면
   자동으로 YOLO 백엔드로 전환됩니다 (`RTWB_YOLO_WEIGHTS` 환경변수로 경로 변경 가능).
 - 합성 샘플 필름은 개발·시연용이며 실제 방사선 사진이 아닙니다.

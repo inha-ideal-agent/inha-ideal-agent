@@ -5,7 +5,8 @@
 합부 판정은 결정론적 룰 엔진 + 판독원의 몫이다(원칙 1 — AI는 판정하지 않는다).
 
 백엔드 2종:
-  - YoloDetector      : ultralytics YOLOv8 가중치(config.YOLO_WEIGHTS_PATH)가 있고
+  - YoloDetector      : Ultralytics YOLO 가중치(config.YOLO_WEIGHTS_PATH; YOLO26s 권장,
+                        YOLOv8/YOLO11 가중치도 같은 API)가 있고
                         import 가능할 때만 사용. import 실패는 예외가 아니라 '사용 불가'.
   - CVFallbackDetector: OpenCV 국소 대비 기반 안전망 — 모델 가중치 없이도
                         데모가 항상 동작하게 한다.
@@ -247,7 +248,7 @@ class CVFallbackDetector:
 
 
 class YoloDetector:
-    """ultralytics YOLOv8 백엔드.
+    """Ultralytics YOLO 백엔드 (YOLO26s 권장 — ultralytics 8.4.x; YOLOv8/11 .pt도 동일 API).
 
     ultralytics 미설치 또는 가중치 부재는 예외가 아니라 '사용 불가'로 처리한다
     (available=False, detect()는 빈 목록). get_detector()가 폴백을 선택한다.
