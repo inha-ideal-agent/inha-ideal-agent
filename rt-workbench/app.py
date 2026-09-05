@@ -59,7 +59,7 @@ COLOR_HUMAN = (60, 120, 255)  # 파랑 — 판독원 직접 추가
 COLOR_MEASURE = (0, 220, 120)  # 초록 — 측정선
 COLOR_CLICK = (255, 0, 255)  # 마젠타 — 진행 중 클릭 십자
 
-PRINCIPLES_SHORT = "원칙: ① AI는 판정하지 않는다 ② 기존 이미지·절차 위에 ③ 탐지는 부품(recall 우선)"
+PRINCIPLES_SHORT = "원칙: ① AI는 판정하지 않는다 ② 기존 이미지·기존 절차 위에 ③ 탐지는 부품(recall 우선)"
 
 PRINCIPLES_FULL = """
 **1. AI는 판정하지 않는다.**
