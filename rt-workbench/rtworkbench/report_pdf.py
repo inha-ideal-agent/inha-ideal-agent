@@ -6,7 +6,8 @@
 
 구성: 헤더(문서명 'RT 판독 소견서', record_id, 일시)
     / 검사 정보 표 / 결함 판정 표 / 종합 판정(크게) / 소견서 본문(줄바꿈 유지)
-    / 푸터(초안 생성 경로, 판정 주체 고지, 데모 기준표 디스클레이머).
+    / 선급 보고 항목 표(IACS UR W33 §8.2·8.5 — 입력된 항목만, 없으면 섹션 생략)
+    / 푸터(적용 기준표 이름·버전, 초안 생성 경로, 판정 주체 고지, 데모 기준표 디스클레이머).
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from rtworkbench.models import DEFECT_TYPES, InspectionRecord
+from rtworkbench.models import DEFECT_TYPES, REPORT_GROUPS, InspectionRecord
 
 # reportlab 내장 한글 CID 폰트 — 폰트 파일 배포 불필요
 _FONT = "HYSMyeongJo-Medium"
@@ -35,6 +36,9 @@ _SOURCE_KO = {
     "template": "오프라인 템플릿",
     "cache": "로컬 캐시(API 사전 생성)",
 }
+
+# 판본 분리 전(구버전) 기록 — 적용 기준표가 기록되지 않음
+_CRITERIA_UNKNOWN = "미기록 (판본 분리 전 기록)"
 
 _LINE = colors.HexColor("#8a8a8a")
 _HEAD_BG = colors.HexColor("#e8e8e8")
@@ -70,9 +74,18 @@ def _styles() -> dict[str, ParagraphStyle]:
     }
 
 
+def _glyph_safe(text: str) -> str:
+    """내장 CID 폰트에 글리프가 없는 문자를 같은 모양의 문자로 치환.
+
+    가운뎃점 U+00B7('·')은 글리프가 없어 조용히 사라진다('선원 종류·크기' → '선원 종류크기').
+    같은 모양으로 렌더링되는 한글 아래아 U+318D('ㆍ')로 바꾼다. 마크업이 섞인 문자열에도 안전하다.
+    """
+    return text.replace("·", "ㆍ")
+
+
 def _xml(text: object) -> str:
-    """Paragraph 마크업용 이스케이프 + 줄바꿈 유지."""
-    return escape(str(text)).replace("\n", "<br/>")
+    """Paragraph 마크업용 이스케이프 + 줄바꿈 유지 + 글리프 치환."""
+    return _glyph_safe(escape(str(text)).replace("\n", "<br/>"))
 
 
 def build_pdf(record: InspectionRecord) -> bytes:
@@ -123,6 +136,11 @@ def build_pdf(record: InspectionRecord) -> bytes:
         (
             "평가 길이", f"{ctx.eval_length_mm:g} mm",
             "용접부 폭", f"{ctx.weld_width_mm:g} mm",
+        ),
+        # 적용 기준표(규격 판본) — 판본 분리 전 기록은 미기록으로 표시
+        (
+            "적용 기준표", record.criteria_name or _CRITERIA_UNKNOWN,
+            "기준표 버전", record.criteria_version or "-",
         ),
     ]
     info_data = [
@@ -185,8 +203,10 @@ def build_pdf(record: InspectionRecord) -> bytes:
     if any(v.is_group for v in record.verdicts):
         story.append(
             Paragraph(
-                "합계 행 = 유형별 그룹 판정: 누적 길이(평가 길이 내 길이 합) · "
-                "투영 면적률(원 근사 면적 합 ÷ 평가 길이 × 용접부 폭, %).",
+                _glyph_safe(
+                    "합계 행 = 유형별 그룹 판정: 누적 길이(평가 길이 내 길이 합) · "
+                    "투영 면적률(원 근사 면적 합 ÷ 평가 길이 × 용접부 폭, %)."
+                ),
                 st["footer"],
             )
         )
@@ -223,15 +243,69 @@ def build_pdf(record: InspectionRecord) -> bytes:
     story.append(Paragraph(_xml(record.report_text or "-"), st["body"]))
     story.append(Spacer(1, 8 * mm))
 
+    # ------------------------------------------------------------ 선급 보고 항목 (입력된 것만)
+    filled = ctx.report.filled_items()
+    if filled:
+        story.append(Paragraph("5. 선급 보고 항목(IACS UR W33 §8)", st["h2"]))
+        n_filled, n_total = ctx.report.coverage()
+        story.append(
+            Paragraph(
+                _xml(
+                    f"입력 항목 {n_filled}/{n_total} · 판정에 관여하지 않는 보고서 기재 사항 "
+                    "(§8.2 일반 항목 중 검사 정보 표에 없는 것 + §8.5 RT 전용 항목)."
+                ),
+                st["footer"],
+            )
+        )
+        story.append(Spacer(1, 1.5 * mm))
+        report_rows: list[list] = [
+            [Paragraph("항목", st["cell_center"]), Paragraph("값", st["cell_center"])]
+        ]
+        report_style = [
+            ("GRID", (0, 0), (-1, -1), 0.4, _LINE),
+            ("BACKGROUND", (0, 0), (-1, 0), _HEAD_BG),
+            ("BACKGROUND", (0, 1), (0, -1), _LABEL_BG),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 3),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ]
+        current_group = None
+        for item, value in filled:
+            if item.group != current_group:
+                # 그룹 구분 행(§8.2 일반 / §8.5 RT 촬영 조건) — 두 칸 병합
+                current_group = item.group
+                row_idx = len(report_rows)
+                report_rows.append(
+                    [Paragraph(_xml(REPORT_GROUPS.get(item.group, item.group)), st["cell"]), ""]
+                )
+                report_style.append(("SPAN", (0, row_idx), (1, row_idx)))
+                report_style.append(("BACKGROUND", (0, row_idx), (1, row_idx), _HEAD_BG))
+            report_rows.append(
+                [
+                    Paragraph(
+                        f"{_xml(item.label_ko)}<br/>"
+                        f"<font size=7 color='#666666'>{_xml(item.label_en)}</font>",
+                        st["cell"],
+                    ),
+                    Paragraph(_xml(value), st["cell"]),
+                ]
+            )
+        report_table = Table(report_rows, colWidths=[78 * mm, 96 * mm], repeatRows=1)
+        report_table.setStyle(TableStyle(report_style))
+        story.append(report_table)
+        story.append(Spacer(1, 8 * mm))
+
     # ------------------------------------------------------------ 푸터
     source_ko = _SOURCE_KO.get(record.report_source, record.report_source)
+    criteria_txt = record.criteria_label or _CRITERIA_UNKNOWN
     footer = (
+        f"적용 기준표: {_xml(criteria_txt)}<br/>"
         f"초안 생성 경로: {_xml(source_ko)} · "
         "판정 주체: 자격 판독원 / AI는 후보 표시·문서화 보조 역할에 한함.<br/>"
         "본 문서의 판정에 적용된 기준표는 ISO 5817 계열의 구조를 모사한 데모 기준이며, "
         "실제 생산 검사 적용 시 선급 NDT 지침에 따라 확정된 기준표로 교체해야 합니다."
     )
-    story.append(Paragraph(footer, st["footer"]))
+    story.append(Paragraph(_glyph_safe(footer), st["footer"]))
 
     doc.build(story)
     return buf.getvalue()

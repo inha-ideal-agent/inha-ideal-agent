@@ -193,3 +193,53 @@ def test_min_confidence_default_suppresses_low_confidence_candidates():
     assert len(default_cands) <= len(all_cands)
     assert len(all_cands) == 30  # 필터 없이는 상위 N 을 채운다
     assert len(default_cands) < 30  # 무결함 필름에서 저신뢰 후보가 걸러진다
+
+
+# --- scripts/eval_detector.py — 계획서·detection.py 주석이 인용하는 측정값 ------------
+
+
+def _load_eval_detector():
+    import importlib.util
+
+    path = Path(__file__).resolve().parent.parent / "scripts" / "eval_detector.py"
+    spec = importlib.util.spec_from_file_location("eval_detector_for_test", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_eval_detector_reproduces_documented_operating_point():
+    """합성 필름 6장 · 임계 0.5 → 재현율 14/14, 장당 오탐 3.8건 (detection.py 주석·앱 캡션·계획서 인용값).
+
+    탐지 파라미터를 바꾸면 `python3 scripts/eval_detector.py` 로 다시 재고 세 곳의 숫자를 함께 갱신한다.
+    """
+    ev = _load_eval_detector()
+    stats = ev.evaluate()
+    assert stats["n_films"] == 6
+    assert stats["min_confidence"] == CVFallbackDetector.MIN_CONFIDENCE == 0.5
+    assert stats["gt_total"] == 14 and stats["hit_total"] == 14, stats["films"]
+    assert stats["recall"] == 1.0
+    assert stats["fp_per_film"] == pytest.approx(3.8, abs=0.05), stats["fp_per_film"]
+    assert stats["fp_per_film"] <= 5.0  # 계획서의 운영 목표(장당 오탐 ≤ 5건)
+    summary = ev.format_summary(stats)
+    assert summary == "합성 필름 6장 실측: 임계 0.5 에서 재현율 14/14, 장당 오탐 3.8건"
+    # detection.py 주석이 같은 문장을 담고 있어야 한다(인용값 동기화)
+    src = (Path(__file__).resolve().parent.parent / "rtworkbench" / "detection.py").read_text(encoding="utf-8")
+    assert summary in " ".join(src.split())  # 주석은 줄바꿈되어 있으므로 공백 정규화 후 대조
+
+
+def test_eval_detector_without_confidence_filter_has_more_false_positives():
+    """임계 없이(0.0) 상위 N 을 채우면 오탐이 크게 늘어난다 — 운영점(0.5)의 존재 이유."""
+    ev = _load_eval_detector()
+    filtered = ev.evaluate()
+    unfiltered = ev.evaluate(min_confidence=0.0)
+    assert unfiltered["hit_total"] >= filtered["hit_total"]
+    assert unfiltered["fp_per_film"] > filtered["fp_per_film"] * 3
+
+
+def test_eval_detector_cli_prints_summary(capsys):
+    ev = _load_eval_detector()
+    assert ev.main([]) == 0
+    out = capsys.readouterr().out
+    assert "RECALL = 14/14" in out and "FP/FILM" in out and "장당 오탐" in out

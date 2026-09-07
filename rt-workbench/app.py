@@ -4,7 +4,7 @@
 
 3대 설계 원칙:
   1. AI는 판정하지 않는다 — 합부는 결정론적 룰 엔진 + 판독원, LLM은 설명/작문 전담.
-  2. 기존 이미지·기존 절차 위에 — 입력은 스캔된 필름 이미지 또는 디지털 RT(CR/DR) 이미지.
+  2. 기존 사진·기존 절차 위에 — 입력은 스캔한 필름 사진 또는 디지털 RT(CR/DR) 사진.
      (필름 디지털화는 조직 단위 전제조건: ISO 14096-2 등급 디지타이저 또는 스캔 서비스)
   3. 탐지는 부품 — recall(민감도) 우선, 오탐은 클릭 한 번·미탐은 배에 남는다.
 
@@ -29,10 +29,14 @@ from rtworkbench import db as archive_db
 from rtworkbench.models import (
     DEFECT_TYPES,
     QUALITY_LEVELS,
+    REPORT_GROUPS,
+    REPORT_ITEMS,
     DefectCandidate,
     InspectionContext,
     InspectionRecord,
     Measurement,
+    ReportDetails,
+    criteria_label,
     new_id,
 )
 
@@ -51,6 +55,12 @@ JOINT_TYPES = ["맞대기(Butt)", "필릿(Fillet)", "T형(Tee)", "겹치기(Lap)
 
 CLICK_MODES = ("없음", "캘리브레이션", "결함 측정", "후보 추가")
 
+# 초안 생성 이후 보고 항목/판정 입력이 바뀌었을 때의 안내 (초안 본문은 지우지 않는다)
+REPORT_STALE_MSG = (
+    "⚠️ 초안 생성 이후 보고 항목 또는 판정 입력이 바뀌었습니다 — 아래 본문은 이전 값을 담고 있을 수 있습니다. "
+    "[초안 생성]으로 다시 만들거나 본문을 직접 고친 뒤 승인하세요."
+)
+
 # 오버레이 색상 (RGB)
 COLOR_PROPOSED = (255, 150, 0)  # 주황 — AI 제안
 COLOR_ACCEPTED = (255, 45, 45)  # 빨강 — 채택
@@ -59,22 +69,64 @@ COLOR_HUMAN = (60, 120, 255)  # 파랑 — 판독원 직접 추가
 COLOR_MEASURE = (0, 220, 120)  # 초록 — 측정선
 COLOR_CLICK = (255, 0, 255)  # 마젠타 — 진행 중 클릭 십자
 
-PRINCIPLES_SHORT = "원칙: ① AI는 판정하지 않는다 ② 기존 이미지·기존 절차 위에 ③ 탐지는 부품(recall 우선)"
+PRINCIPLES_SHORT = "원칙: ① AI는 판정하지 않는다 ② 기존 사진·기존 절차 위에 ③ 탐지는 부품(recall 우선)"
 
 PRINCIPLES_FULL = """
 **1. AI는 판정하지 않는다.**
 합격/불합격은 결정론적 룰 엔진(기준표 JSON)과 자격 판독원이 결정한다.
 LLM은 이미 확정된 판정 결과를 공식 문체로 정리하는 작문 보조일 뿐이다.
 
-**2. 기존 이미지·기존 절차 위에.**
-판독원 개인에게 새 장비·새 촬영 절차를 요구하지 않는다. 입력은 스캔된 필름
-이미지 또는 디지털 RT(CR/DR) 이미지이며, 필름 디지털화(ISO 14096-2 등급
-디지타이저 또는 스캔 서비스)는 조직 단위 전제조건으로 명시한다.
+**2. 기존 사진·기존 절차 위에.**
+판독원 개인에게 새 장비·새 촬영 절차를 요구하지 않는다.
+입력은 **스캔한 필름 사진 또는 디지털 RT(CR/DR) 사진**이며, 둘 다 같은 파이프라인으로 처리한다.
+단, 필름 디지털화(ISO 14096-2 등급 디지타이저 또는 스캔 서비스)는 **조직 단위 전제조건**으로 명시한다.
 
 **3. 탐지는 부품이다.**
 결함 후보 탐지기는 교체 가능한 부품이며 recall(민감도)을 우선한다.
 오탐(false positive)은 판독원의 클릭 한 번으로 기각되지만,
 미탐(false negative)은 배에 남는다.
+새로움은 탐지 하나가 아니라 판독 업무 전체(2차 눈·판정·소견서·기록)를 하나로 잇는 통합에 있다.
+"""
+
+# 📖 기준표·정보 탭 맨 위 — 처음 보는 사람을 위한 용어 풀이 (8줄 이내 유지)
+GLOSSARY_MD = """
+**이 프로토타입은 무엇이고 무엇이 아닌가** — 처음 보는 분을 위한 용어 풀이
+- **RT** = 방사선투과검사. 용접부를 X선/감마선으로 찍어 내부 결함을 보는 검사
+- **판독** = 필름/이미지를 보고 결함을 찾아 합격/불합격을 정하는 일 — 이 앱은 판독을 돕는 도구이고, 합부는 규칙 엔진 + 판독원이 정한다
+- **선급** = 배의 안전 기준을 정하고 검사하는 기관(KR, DNV, ABS 등) · **IACS** = 선급들의 국제 협회
+- **IQI** = 사진 화질을 확인하는 표준 지시계 — 이 앱에서는 납마커와 함께 2클릭 자의 기준물로도 쓴다
+- 이 프로토타입은 **판정 AI가 아니다**: AI는 후보 표시·소견서 작문·검색 보조만 하고, 판정·승인은 언제나 사람이 한다
+"""
+
+# 참고 자료 — README.md "## 참고 자료" 와 같은 목록 (테스트가 두 곳을 대조한다)
+REFERENCES_MD = """
+**규칙·규격**
+1. IACS UR W33 Rev.1/Corr.1 (2021) §3.3·§8·§9.2 — 선급 NDT 규칙 (§8: 보고서 필수 항목 25개)
+2. IACS UR W33 Rev.2 · W34 Rev.1 — 2026.07.15 승인, 2028.01.01 이후 건조계약분 적용, 100 mm 평가 길이
+3. ISO 10675-1:2021 — 용접부 RT 허용 레벨(1·2·3)
+4. ISO 5817:2023 — 강 용접부 품질 등급(B·C·D)
+5. ISO 17636-1/-2:2022 — RT 촬영 기법(필름 / 디지털 검출기)
+6. ISO 14096-2 — 필름 디지타이저 등급(DS/DB/DA) — 필름 스캔의 조직 단위 전제조건
+7. ISO 9712:2021 — NDT 인력 자격(판정은 Level 2 이상)
+
+**데이터셋**
+8. GDXray — Mery et al., J Nondestruct Eval 34:42, 2015 (Welds 시리즈, 연구·교육 목적만)
+9. RIAWELC — Totino·Spagnolo·Perri 2022, GitHub (조각 사진 4종 분류, 위치 박스 없음)
+10. AI Hub 71761 용접 AI 학습 데이터 — NIA 2023 (RT·VT 용접 사진, 폴리곤 라벨; 수치는 활용 신청 시 데이터셋 페이지에서 확인)
+
+**논문**
+11. WeldVGG — Sensors 25(19):6183, 2025 (데이터셋 간 제로샷 전이 한계)
+12. Palma-Ramírez et al. — Heliyon 2024, e30590
+13. Lu et al. — J Nondestruct Eval 44:91, 2025 (GDXray mAP@0.5 97.2%)
+
+**도구**
+14. Ultralytics YOLO26 — 2026.01 공개, AGPL-3.0 (사내 배포 시 Enterprise 라이선스; YOLO26s 권장)
+15. Streamlit — 브라우저 UI(내 PC에서 실행, 같은 와이파이의 태블릿 접속)
+16. Ollama / vLLM — OpenAI 호환 로컬 LLM API
+17. EXAONE 3.5 / 4.x — LG AI연구원 한국어 모델 (로컬 기본값 exaone3.5:7.8b)
+18. HyperCLOVA X SEED — NAVER 한국어 모델 후보 (검색 요약 기준)
+
+"(검색 요약 기준)" 표시는 원문이 아닌 검색 스니펫으로만 확인한 항목 — 제출 전 원문 확인 필요.
 """
 
 
@@ -96,6 +148,7 @@ _STATE_DEFAULTS: dict = {
     "wb_report_text": "",
     "wb_report_source": "",
     "wb_report_payload": "",
+    "wb_report_stale": False,  # 초안 생성 이후 판정 입력/보고 항목이 바뀌어 본문이 낡았을 수 있음
     "wb_pdf_bytes": None,
     "wb_record_id": "",
     "wb_archived": False,
@@ -103,6 +156,9 @@ _STATE_DEFAULTS: dict = {
     "wb_click_last_time": None,  # 직전 처리한 클릭 unix_time (재클릭/중복 방지)
     "wb_det_status": None,  # 탐지 백엔드 상태 캐시
     "wb_started_at": None,  # 이미지 로드 시각 — 판독 소요시간 측정 (창출 효과 정량화)
+    # 판정 실행에 실제 사용된 기준표 {id, name, version} — verdicts와 함께 무효화된다.
+    # (선택 selectbox 값 "wb_criteria_id"는 위젯이 소유하므로 여기서 초기화하지 않는다)
+    "wb_criteria_used": None,
 }
 
 
@@ -132,18 +188,28 @@ def reset_for_new_image() -> None:
     # (invalidate_judgment는 같은 이미지 내 재판정 시 편집 보호를 위해 남긴다).
     st.session_state["wb_report_text"] = ""
     invalidate_judgment()
+    st.session_state["wb_report_stale"] = False  # 본문을 비웠으므로 낡은 초안도 없다
 
 
 def invalidate_judgment() -> None:
     """후보/측정이 바뀌면 판정·소견서·PDF 산출물을 무효화한다.
 
     소견서 본문(wb_report_text)은 판독원이 편집 중일 수 있으므로 지우지 않는다.
+    대신 생성해 둔 초안이 있었다면 '낡음' 표시를 남겨 재생성을 안내한다.
     """
+    _mark_report_stale()
     st.session_state["wb_verdicts"] = []
     st.session_state["wb_overall"] = None
+    st.session_state["wb_criteria_used"] = None
     st.session_state["wb_report_source"] = ""
     st.session_state["wb_report_payload"] = ""
     st.session_state["wb_pdf_bytes"] = None
+
+
+def _mark_report_stale() -> None:
+    """생성해 둔 초안(payload 有)이 있으면 낡음 표시 — 본문은 지우지 않는다."""
+    if st.session_state.get("wb_report_payload"):
+        st.session_state["wb_report_stale"] = True
 
 
 def on_click_mode_change() -> None:
@@ -372,6 +438,78 @@ def get_detector_status() -> dict:
     return st.session_state["wb_det_status"]
 
 
+def criteria_entries() -> list[dict]:
+    """사이드바 selectbox용 기준표(규격 판본) 목록 — rules.list_criteria().
+
+    목록 읽기에 실패하면(깨진 JSON 등) 오류를 표시하고 기본 기준표 1건으로 폴백한다 —
+    잘못된 파일 하나 때문에 판독 자체가 멈추면 안 되지만, 그 사실은 숨기지 않는다.
+    """
+    try:
+        entries = rules.list_criteria()
+    except Exception as exc:
+        st.error(f"기준표 목록을 읽지 못했습니다 — 기본 기준표만 사용합니다: {exc}")
+        entries = []
+    if not any(e["id"] == rules.DEFAULT_CRITERIA_ID for e in entries):
+        entries.insert(0, criteria_info(rules.DEFAULT_CRITERIA_ID))
+    return entries
+
+
+def selected_criteria_id() -> str:
+    """사이드바에서 선택된 기준표 id (선택 전이면 기본 기준표)."""
+    return str(st.session_state.get("wb_criteria_id") or rules.DEFAULT_CRITERIA_ID)
+
+
+def criteria_info(cid: str) -> dict:
+    """기준표 id → {id, path, name, version, edition_note}. 로드 실패 시 id만 채운 항목."""
+    try:
+        engine = rules.RuleEngine(cid)
+    except Exception:
+        return {"id": cid, "path": None, "name": cid, "version": "", "edition_note": ""}
+    return {
+        "id": engine.criteria_id,
+        "path": engine.criteria_path,
+        "name": engine.criteria_name,
+        "version": engine.criteria_version,
+        "edition_note": str(engine.meta.get("edition_note", "")),
+    }
+
+
+def used_criteria_label() -> str:
+    """현재 verdicts를 산출한 기준표 표기 '이름 (v버전)' — 판정 전이면 ''."""
+    used = st.session_state.get("wb_criteria_used") or {}
+    return criteria_label(used.get("name", ""), used.get("version", ""))
+
+
+def report_widget_key(item_key: str) -> str:
+    """선급 보고 항목 위젯의 session_state 키."""
+    return f"wb_rpt_{item_key}"
+
+
+def build_report_from_sidebar() -> ReportDetails:
+    """사이드바 '선급 보고 항목' 위젯 값 → ReportDetails (문서 전용 — 판정에 관여하지 않음)."""
+    values: dict = {}
+    for item in REPORT_ITEMS:
+        raw = st.session_state.get(report_widget_key(item.key))
+        if item.key == "repairs_count":
+            values[item.key] = int(raw or 0)
+        else:
+            values[item.key] = str(raw or "").strip()
+    return ReportDetails(**values)
+
+
+def invalidate_pdf_only() -> None:
+    """선급 보고 항목 변경 시 — 판정은 그대로 두되, 그 항목이 실린 산출물은 낡은 것으로 본다.
+
+    - 미리 생성한 PDF(5절 보고 항목 표)를 버린다.
+    - 초안 payload('[촬영 조건]' 섹션)·생성 경로를 비운다 — 초안 본문(wb_report_text)은 판독원이
+      편집 중일 수 있어 남기되, 낡음 표시로 재생성을 안내한다(PDF 4절 본문 ↔ 5절 표 불일치 방지).
+    """
+    _mark_report_stale()
+    st.session_state["wb_report_payload"] = ""
+    st.session_state["wb_report_source"] = ""
+    st.session_state["wb_pdf_bytes"] = None
+
+
 def build_context_from_sidebar() -> InspectionContext:
     """사이드바 위젯 값 + 세션의 스케일로 InspectionContext 조립."""
     return InspectionContext(
@@ -387,6 +525,8 @@ def build_context_from_sidebar() -> InspectionContext:
         # 그룹 판정(누적 길이·투영 면적률)의 기준 구간 — 사이드바 입력
         eval_length_mm=float(st.session_state.get("wb_ctx_eval_len", 100.0)),
         weld_width_mm=float(st.session_state.get("wb_ctx_weld_w", 20.0)),
+        # 선급 보고 항목(IACS UR W33 §8.2·8.5) — 문서 전용, 룰 판정 입력이 아니다
+        report=build_report_from_sidebar(),
     )
 
 
@@ -410,6 +550,8 @@ def assemble_record(report_text: str) -> InspectionRecord:
         st.session_state["wb_record_id"] = new_id("rec")
     ctx = build_context_from_sidebar()
     source = st.session_state["wb_report_source"] or "template"
+    # 판정에 실제 사용된 기준표(판정 시점에 기록) — 없으면 현재 선택된 기준표
+    used = st.session_state.get("wb_criteria_used") or criteria_info(selected_criteria_id())
     return InspectionRecord(
         record_id=st.session_state["wb_record_id"],
         context=ctx,
@@ -426,6 +568,8 @@ def assemble_record(report_text: str) -> InspectionRecord:
             if st.session_state.get("wb_started_at")
             else None
         ),
+        criteria_name=str(used.get("name", "")),
+        criteria_version=str(used.get("version", "")),
     )
 
 
@@ -440,22 +584,27 @@ def try_build_pdf(record: InspectionRecord) -> bytes | None:
         return None
 
 
-def verdicts_to_df(verdicts) -> pd.DataFrame:
-    """RuleVerdict 목록 → 표시용 DataFrame."""
+def verdicts_to_df(verdicts, criteria_label: str = "") -> pd.DataFrame:
+    """RuleVerdict 목록 → 표시용 DataFrame.
+
+    criteria_label('이름 (v버전)')이 주어지면 '기준표' 열을 덧붙인다 — 어느 규격 판본으로
+    판정했는지가 표(및 CSV 복사본)만 봐도 드러나도록.
+    """
     rows = []
     for v in verdicts:
         # 단위는 셀마다 명시 — 단일 판정 mm, 투영 면적률 그룹 판정 %
-        rows.append(
-            {
-                "결함 ID": v.display_id,  # 그룹 판정은 '합계(기공)' 형태
-                "유형": DEFECT_TYPES.get(v.defect_type, v.defect_type),
-                "크기": f"{v.size_mm:.2f} {v.unit}",
-                "허용 한계": "허용 불가" if v.limit_mm is None else f"{v.limit_mm:.2f} {v.unit}",
-                "근거 조항": v.clause,
-                "합부": "✅ 합격" if v.passed else "❌ 불합격",
-                "판정 근거": v.detail,
-            }
-        )
+        row = {
+            "결함 ID": v.display_id,  # 그룹 판정은 '합계(기공)' 형태
+            "유형": DEFECT_TYPES.get(v.defect_type, v.defect_type),
+            "크기": f"{v.size_mm:.2f} {v.unit}",
+            "허용 한계": "허용 불가" if v.limit_mm is None else f"{v.limit_mm:.2f} {v.unit}",
+            "근거 조항": v.clause,
+            "합부": "✅ 합격" if v.passed else "❌ 불합격",
+            "판정 근거": v.detail,
+        }
+        if criteria_label:
+            row["기준표"] = criteria_label
+        rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -767,7 +916,8 @@ def _render_judgment(ctx: InspectionContext) -> None:
             )
             return
         try:
-            engine = rules.RuleEngine()
+            # 사이드바에서 선택한 기준표(규격 판본) — JSON만 다를 뿐 룰 엔진 코드는 동일
+            engine = rules.RuleEngine(selected_criteria_id())
             verdicts = engine.evaluate_all(
                 items, ctx.thickness_mm, ctx.quality_level,
                 eval_length_mm=ctx.eval_length_mm, weld_width_mm=ctx.weld_width_mm,
@@ -777,13 +927,24 @@ def _render_judgment(ctx: InspectionContext) -> None:
             return
         st.session_state["wb_verdicts"] = verdicts
         st.session_state["wb_overall"] = rules.overall_pass(verdicts)
+        # 판정에 실제 쓰인 기준표를 verdicts와 함께 기록 — 소견서/PDF/아카이브에 남는다
+        st.session_state["wb_criteria_used"] = {
+            "id": engine.criteria_id,
+            "name": engine.criteria_name,
+            "version": engine.criteria_version,
+        }
         st.session_state["wb_pdf_bytes"] = None  # 판정이 바뀌면 이전 PDF 무효
 
     verdicts = st.session_state["wb_verdicts"]
     overall = st.session_state["wb_overall"]
     if overall is not None:
+        label = used_criteria_label()
+        if label:
+            st.caption(f"📐 적용 기준표: {label}")
         if verdicts:
-            st.dataframe(verdicts_to_df(verdicts), width="stretch", hide_index=True)
+            st.dataframe(
+                verdicts_to_df(verdicts, criteria_label=label), width="stretch", hide_index=True
+            )
             if any(rules.is_group_verdict(v) for v in verdicts):
                 st.caption("합계 행 = 누적 길이·투영 면적률(원 근사) 그룹 판정")
         else:
@@ -818,7 +979,11 @@ def _render_report(ctx: InspectionContext) -> None:
                 st.session_state["wb_report_payload"] = payload
                 st.session_state["wb_report_source"] = source
                 st.session_state["wb_report_text"] = text
+                st.session_state["wb_report_stale"] = False
                 st.session_state["wb_pdf_bytes"] = None
+
+    if st.session_state.get("wb_report_stale") and str(st.session_state.get("wb_report_text", "")).strip():
+        st.warning(REPORT_STALE_MSG)
 
     source = st.session_state["wb_report_source"]
     if source:
@@ -1134,10 +1299,14 @@ def render_tab_archive() -> None:
     info = pd.DataFrame(
         {
             "항목": ["필름 ID", "블록", "용접부 ID", "이음 종류", "두께(mm)", "품질등급",
+                    "적용 기준표", "기준표 버전",
                     "판독원", "기법", "스케일(mm/px)", "이미지", "승인 일시", "초안 경로",
                     "판독 소요시간"],
             "값": [ctx.film_id, ctx.block, ctx.weld_id, ctx.joint_type,
-                   f"{ctx.thickness_mm:g}", ctx.quality_level, ctx.inspector, ctx.technique,
+                   f"{ctx.thickness_mm:g}", ctx.quality_level,
+                   # 판본 분리 전 기록은 기준표 미기록
+                   rec.criteria_name or "미기록 (판본 분리 전 기록)", rec.criteria_version or "-",
+                   ctx.inspector, ctx.technique,
                    f"{ctx.scale_mm_per_px:.4f}" if ctx.scale_mm_per_px else "미확정",
                    rec.image_name, rec.created_at, rec.report_source,
                    f"{rec.elapsed_seconds / 60:.1f}분" if rec.elapsed_seconds else "기록 없음"],
@@ -1150,9 +1319,29 @@ def render_tab_archive() -> None:
             st.success("종합 판정: 합격 ✅")
         else:
             st.error("종합 판정: 불합격 ❌")
+        # 선급 보고 항목(IACS UR W33 §8.2·8.5) — 저장된 것만. 구버전 기록은 0/25.
+        n_filled, n_total = ctx.report.coverage()
+        with st.expander(f"선급 보고 항목(IACS UR W33 §8) — {n_filled}/{n_total} 입력",
+                         expanded=False):
+            filled = ctx.report.filled_items()
+            if filled:
+                st.table(
+                    pd.DataFrame(
+                        {
+                            "구분": [REPORT_GROUPS.get(i.group, i.group) for i, _ in filled],
+                            "항목": [i.label_ko for i, _ in filled],
+                            "값": [v for _, v in filled],
+                        }
+                    )
+                )
+            else:
+                st.caption("입력된 선급 보고 항목이 없습니다.")
     with c2:
         if rec.verdicts:
-            st.dataframe(verdicts_to_df(rec.verdicts), width="stretch", hide_index=True)
+            st.dataframe(
+                verdicts_to_df(rec.verdicts, criteria_label=rec.criteria_label),
+                width="stretch", hide_index=True,
+            )
         else:
             st.caption("판정 결함 없음.")
         st.markdown("**소견서 본문**")
@@ -1267,17 +1456,51 @@ def render_tab_loop() -> None:
 
 
 def render_tab_info() -> None:
+    st.caption(GLOSSARY_MD)
+    st.divider()
+
     st.subheader("판정 기준표")
+    cid = selected_criteria_id()
     try:
-        engine = rules.RuleEngine()
+        engine = rules.RuleEngine(cid)
         meta = engine.meta
         st.warning(f"⚠️ {meta.get('disclaimer', '')}")
-        st.caption(f"기준표: {meta.get('name', '')} · 버전 {meta.get('version', '')}")
+        st.caption(
+            f"현재 선택(사이드바 '기준표(규격 판본)'): **{engine.criteria_label}** · "
+            f"파일 `{engine.criteria_path.name}`"
+        )
+        if meta.get("edition_note"):
+            st.caption(f"📐 {meta['edition_note']}")
     except Exception as exc:
         st.error(f"기준표 로드에 실패했습니다: {exc}")
 
+    st.markdown("**사용 가능한 기준표 — 규격 판본별 JSON**")
+    st.caption(
+        "건조계약일에 따라 적용 판본이 다릅니다(IACS UR W33 Rev.2: 2028.01.01 이후 건조계약분은 "
+        "ISO 5817:2023/ISO 10675-1:2021 구조). 룰 엔진 코드는 동일하며 criteria/ 디렉터리에 "
+        "JSON을 추가·교체하는 것만으로 대응합니다. 현재 두 파일 모두 데모 값입니다."
+    )
     try:
-        criteria = json.loads(Path(config.CRITERIA_PATH).read_text(encoding="utf-8"))
+        entries = rules.list_criteria()
+    except Exception as exc:
+        st.error(f"기준표 목록을 읽지 못했습니다: {exc}")
+    else:
+        st.table(
+            pd.DataFrame(
+                {
+                    "선택": ["✅" if e["id"] == cid else "" for e in entries],
+                    "기준표": [e["name"] for e in entries],
+                    "버전": [e["version"] for e in entries],
+                    "판본 메모": [e["edition_note"] for e in entries],
+                    "파일": [Path(e["path"]).name for e in entries],
+                }
+            )
+        )
+
+    try:
+        criteria = json.loads(
+            rules.resolve_criteria_path(cid).read_text(encoding="utf-8")
+        )
         st.json(criteria, expanded=False)
     except Exception as exc:
         st.error(f"기준표 JSON 표시에 실패했습니다: {exc}")
@@ -1289,6 +1512,20 @@ def render_tab_info() -> None:
     st.divider()
     st.subheader("탐지 백엔드 상태")
     status = get_detector_status()
+    if status.get("yolo_available"):
+        st.caption(
+            f"현재 **Ultralytics YOLO 백엔드** 사용 중(가중치 `{status.get('weights_path')}`). "
+            "가중치를 치우면 학습된 모델이 아닌 OpenCV 규칙 기반 휴리스틱 폴백 탐지기로 자동 복귀합니다. "
+            "어느 백엔드든 후보 표시만 하며 판정은 하지 않습니다."
+        )
+    else:
+        st.caption(
+            "지금 프로토타입의 기본 백엔드는 학습된 모델이 아닌 **OpenCV 규칙 기반(국소 대비) 휴리스틱 폴백 탐지기**입니다"
+            "(합성 필름 자체 측정: 결함 14/14 검출, 장당 오탐 3.8건 · 임계 0.5). "
+            f"Ultralytics YOLO 가중치(**YOLO26s 권장**, YOLOv8/11도 같은 방식)를 `{status.get('weights_path')}`"
+            "(환경변수 RTWB_YOLO_WEIGHTS)에 두면 **자동으로 YOLO 백엔드로 전환**됩니다. "
+            "어느 백엔드든 후보 표시만 하며 판정은 하지 않습니다."
+        )
     st.write(
         {
             "backend": status.get("backend"),
@@ -1301,8 +1538,11 @@ def render_tab_info() -> None:
     st.divider()
     st.subheader("LLM 정책")
     st.caption(
-        "기본 정책: 로컬 LLM 또는 오프라인 템플릿. "
-        "외부 클라우드 API는 RTWB_ALLOW_CLOUD_LLM=1 로 명시 허용 시에만 사용"
+        "기본 정책(로컬 우선): 사내 PC의 **로컬 LLM**(Ollama·vLLM 등 OpenAI 호환 API — "
+        "기본 모델 **EXAONE 3.5**, 설정 기본값 `exaone3.5:7.8b`; EXAONE 4.x·HyperCLOVA X SEED 등으로 교체 가능) "
+        "또는 오프라인 템플릿. 외부 클라우드 API(Claude → Gemini)는 **옵트인** — "
+        "RTWB_ALLOW_CLOUD_LLM=1 로 명시 허용 시에만 사용하며 키가 있어도 기본 차단. "
+        "이미지·실명·파일 경로는 어떤 경우에도 보내지 않습니다(전송 내용 미리보기 제공)."
     )
     try:
         from rtworkbench import report_llm  # 지연 import — 병렬 구현 모듈
@@ -1318,9 +1558,12 @@ def render_tab_info() -> None:
                     "항목": ["외부 클라우드 LLM", "로컬 LLM URL", "로컬 모델", "로컬 LLM 연결",
                            "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "실제 폴백 순서"],
                     "값": [
-                        "허용 (RTWB_ALLOW_CLOUD_LLM=1)" if pol.get("cloud_allowed") else "차단 (기본)",
+                        "허용 — 옵트인 (RTWB_ALLOW_CLOUD_LLM=1)" if pol.get("cloud_allowed")
+                        else "차단 (기본 — 옵트인 필요)",
                         pol.get("local_url") or "(미설정)",
-                        pol.get("local_model") or "-",
+                        (pol.get("local_model") or "-")
+                        + (" (EXAONE 3.5 — 설정 기본값)"
+                           if str(pol.get("local_model") or "").lower().startswith("exaone3.5") else ""),
                         "미설정" if reach is None
                         else ("🟢 연결됨" if reach else "🔴 연결 안 됨 → 오프라인 템플릿 폴백"),
                         "설정됨" if pol.get("anthropic_key") else "없음",
@@ -1332,12 +1575,49 @@ def render_tab_info() -> None:
         )
 
     st.divider()
+    st.subheader("참고 자료")
+    st.caption("제안서 참고 문헌과 같은 목록입니다 — README.md의 '참고 자료' 절과 동일하게 유지합니다.")
+    st.markdown(REFERENCES_MD)
+
+    st.divider()
     st.caption(f"RT 판독 워크벤치 v{__version__} — \"판독은 자격자가, 서류는 AI가.\"")
 
 
 # ---------------------------------------------------------------------------
 # 사이드바
 # ---------------------------------------------------------------------------
+
+
+def _render_report_details_inputs() -> None:
+    """선급 보고 항목(IACS UR W33 §8.2·8.5) 입력 — 접힌 expander + 'n/25 입력' 캡션.
+
+    판정에 관여하지 않는 문서 전용 필드이므로 on_change 는 미리 생성한 PDF만 무효화한다
+    (invalidate_judgment 를 호출하지 않는다).
+    """
+    with st.expander("선급 보고 항목(IACS UR W33 §8.2·8.5)", expanded=False):
+        st.caption(
+            "선급 제출 보고서에 요구되는 항목 중 위 '검사 컨텍스트'에 없는 것. "
+            "판정에는 쓰이지 않고 소견서 PDF·초안 payload·아카이브에 실립니다. "
+            "성명·서명은 입력하지 않습니다(자격 등급만)."
+        )
+        for group_key, group_label in REPORT_GROUPS.items():
+            st.markdown(f"**{group_label}**")
+            for item in (i for i in REPORT_ITEMS if i.group == group_key):
+                label = f"{item.label_ko}" + (f" ({item.unit})" if item.unit else "")
+                if item.key == "repairs_count":
+                    st.number_input(
+                        label, min_value=0, max_value=99, value=0, step=1,
+                        key=report_widget_key(item.key), on_change=invalidate_pdf_only,
+                        help=f"W33 §8.2 — {item.label_en}. 0 = 해당 없음",
+                    )
+                else:
+                    section = "§8.2" if item.group == "general" else "§8.5"
+                    st.text_input(
+                        label, key=report_widget_key(item.key), placeholder=item.placeholder,
+                        on_change=invalidate_pdf_only, help=f"W33 {section} — {item.label_en}",
+                    )
+    n_filled, n_total = build_report_from_sidebar().coverage()
+    st.caption(f"📋 선급 보고 항목 {n_filled}/{n_total} 입력")
 
 
 def render_sidebar() -> InspectionContext:
@@ -1360,6 +1640,22 @@ def render_sidebar() -> InspectionContext:
             "품질등급 (B: 엄격 > C > D)", list(QUALITY_LEVELS),
             key="wb_ctx_quality", on_change=invalidate_judgment,
         )
+        # 기준표(규격 판본) — 룰 판정의 직접 입력. 바뀌면 기존 판정을 무효화한다.
+        # 건조계약일 기준: 2028.01.01 이후(IACS UR W33 Rev.2) → 2023/2021 구조, 이전 → 2014/2016 구조
+        entries = criteria_entries()
+        ids = [e["id"] for e in entries]
+        names = {e["id"]: e["name"] for e in entries}
+        default_idx = ids.index(rules.DEFAULT_CRITERIA_ID) if rules.DEFAULT_CRITERIA_ID in ids else 0
+        st.selectbox(
+            "기준표(규격 판본)", ids, index=default_idx,
+            format_func=lambda i: names.get(i, i),
+            key="wb_criteria_id", on_change=invalidate_judgment,
+            help="건조계약일에 따라 적용 규격 판본이 다릅니다 — 기준표 JSON만 바뀌고 룰 엔진은 그대로입니다. "
+                 "현재 두 기준표 모두 데모 값입니다.",
+        )
+        sel = next((e for e in entries if e["id"] == selected_criteria_id()), None)
+        if sel is not None and (sel["edition_note"] or sel["version"]):
+            st.caption(f"📐 {sel['edition_note'] or sel['name']} · v{sel['version']}")
         st.text_input("판독원", key="wb_ctx_inspector", placeholder="성명/자격번호")
         # 그룹 판정(누적 길이·투영 면적률)의 기준 구간 — 바뀌면 기존 판정을 무효화한다
         st.markdown("**그룹 판정 기준 구간**")
@@ -1373,6 +1669,9 @@ def render_sidebar() -> InspectionContext:
             key="wb_ctx_weld_w", on_change=invalidate_judgment,
             help="투영 면적률 = Σ원 근사 면적 ÷ (평가 길이 × 용접부 폭)",
         )
+
+        st.divider()
+        _render_report_details_inputs()
 
         st.divider()
         st.markdown("**탐지 백엔드**")

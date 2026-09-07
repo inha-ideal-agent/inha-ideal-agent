@@ -11,11 +11,24 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import pytest
 
+from rtworkbench import config
 from rtworkbench.models import RuleVerdict
-from rtworkbench.rules import RuleEngine, is_group_verdict, overall_pass
+from rtworkbench.rules import (
+    DEFAULT_CRITERIA_ID,
+    RuleEngine,
+    is_group_verdict,
+    list_criteria,
+    overall_pass,
+    resolve_criteria_path,
+)
+
+# 규격 판본별 데모 기준표 id (criteria/<id>.json)
+CRITERIA_2023 = "demo_iso5817_like"  # ISO 5817:2023/10675-1:2021 구조 — 기본 (2028.01 이후 건조계약분)
+CRITERIA_2014 = "demo_iso5817_2014_like"  # ISO 5817:2014/10675-1:2016 구조 (2028.01 이전 건조계약분)
 
 
 @pytest.fixture(scope="module")
@@ -523,3 +536,104 @@ def test_기준표_group_불허_등급은_한계_수치_없이_로드된다(tmp_
     )
     g = RuleEngine(ok).evaluate_group("porosity", [1.0], 12.0, "B")
     assert g.passed is False and g.limit_mm is None and g.clause == "G"
+
+
+# ═══════════════ 규격 판본별 기준표 JSON 분리 (list_criteria / id 로드) ═══════════════
+
+
+def test_list_criteria_두_판본을_모두_찾고_기본이_맨_앞():
+    entries = list_criteria()
+    ids = [e["id"] for e in entries]
+    assert CRITERIA_2023 in ids and CRITERIA_2014 in ids
+    assert ids[0] == DEFAULT_CRITERIA_ID == CRITERIA_2023  # 기본 기준표가 맨 앞
+    for e in entries:
+        assert set(e) == {"id", "path", "name", "version", "edition_note"}
+        assert Path(e["path"]).is_file() and Path(e["path"]).stem == e["id"]
+        assert e["name"] and e["version"] and e["edition_note"]
+
+
+def test_list_criteria_판본_메모와_이름이_판본을_구분한다():
+    by_id = {e["id"]: e for e in list_criteria()}
+    e23, e14 = by_id[CRITERIA_2023], by_id[CRITERIA_2014]
+    assert "2023" in e23["name"] and "2021" in e23["edition_note"]
+    assert "IACS UR W33" in e23["edition_note"] and "2028.01.01 이후" in e23["edition_note"]
+    assert "2014" in e14["name"] and "2016" in e14["edition_note"]
+    assert "2028.01.01 이전" in e14["edition_note"]
+    assert e23["version"] != e14["version"]
+
+
+@pytest.mark.parametrize("cid", [CRITERIA_2023, CRITERIA_2014])
+def test_두_기준표_meta는_데모_값임을_명시(cid):
+    meta = RuleEngine(cid).meta
+    for key in ("name", "version", "edition_note", "disclaimer", "quality_levels"):
+        assert key in meta, key
+    assert "데모" in meta["name"]
+    assert "데모 값" in meta["disclaimer"] and "규격 원문" in meta["disclaimer"]
+    assert meta["quality_levels"] == ["B", "C", "D"]
+
+
+def test_엔진은_id로도_경로로도_같은_기준표를_로드한다():
+    by_id = RuleEngine(CRITERIA_2014)
+    by_path = RuleEngine(config.CRITERIA_DIR / f"{CRITERIA_2014}.json")
+    by_str_path = RuleEngine(str(config.CRITERIA_DIR / f"{CRITERIA_2014}.json"))
+    assert by_id.meta == by_path.meta == by_str_path.meta
+    assert by_id.criteria_id == CRITERIA_2014
+    assert by_id.criteria_path == config.CRITERIA_DIR / f"{CRITERIA_2014}.json"
+    assert by_id.criteria_name == by_id.meta["name"]
+    assert by_id.criteria_version == by_id.meta["version"]
+    assert by_id.criteria_label == f"{by_id.criteria_name} (v{by_id.criteria_version})"
+
+
+def test_기본_엔진은_기본_기준표와_동일(engine):
+    assert RuleEngine().meta == RuleEngine(CRITERIA_2023).meta == engine.meta
+    assert engine.criteria_id == DEFAULT_CRITERIA_ID
+    assert resolve_criteria_path() == Path(config.CRITERIA_PATH)
+    assert resolve_criteria_path(CRITERIA_2023) == Path(config.CRITERIA_PATH)
+
+
+def test_판본이_다르면_같은_결함도_한계와_조항이_다르다():
+    """판본 전환 = JSON 교체만 — 같은 입력(기공 2.8mm, t=12, B)에 다른 한계/조항/합부."""
+    e23, e14 = RuleEngine(CRITERIA_2023), RuleEngine(CRITERIA_2014)
+    v23 = e23.evaluate("p", "porosity", 2.8, thickness_mm=12.0, quality_level="B")
+    v14 = e14.evaluate("p", "porosity", 2.8, thickness_mm=12.0, quality_level="B")
+    assert (v23.limit_mm, v23.passed, v23.clause) == (2.4, False, "DEMO-2011")  # min(0.2×12, 3.0)
+    assert (v14.limit_mm, v14.passed, v14.clause) == (3.0, True, "DEMO14-2011")  # min(0.25×12, 3.5)
+    # 그룹 판정(투영 면적률) 한계도 판본별로 다르다
+    assert e23.evaluate_group("porosity", [1.0], 12.0, "B").limit_mm == 1.0
+    assert e14.evaluate_group("porosity", [1.0], 12.0, "B").limit_mm == 1.5
+    # 불허 유형(균열)은 두 판본 모두 fail-safe로 불합격
+    for e in (e23, e14):
+        assert e.evaluate("c", "crack", 0.1, thickness_mm=12.0, quality_level="D").passed is False
+
+
+def test_두_판본은_같은_스키마_같은_결함_유형_목록():
+    """룰 엔진이 JSON 교체만으로 대응하려면 두 파일의 규칙 키 집합이 같아야 한다."""
+    r23 = RuleEngine(CRITERIA_2023)._data["rules"]
+    r14 = RuleEngine(CRITERIA_2014)._data["rules"]
+    assert set(r23) == set(r14)
+    for dtype in r23:
+        assert set(r23[dtype]["levels"]) == set(r14[dtype]["levels"]) == {"B", "C", "D"}
+        assert ("group" in r23[dtype]) == ("group" in r14[dtype])
+
+
+def test_없는_기준표_id는_FileNotFoundError_사용가능_id_안내():
+    with pytest.raises(FileNotFoundError) as ei:
+        RuleEngine("no_such_criteria")
+    assert CRITERIA_2023 in str(ei.value) and CRITERIA_2014 in str(ei.value)
+
+
+def test_list_criteria_임의_디렉터리_파일명순_및_깨진_JSON은_ValueError(tmp_path):
+    good = '{"meta": {"name": "%s", "version": "v%d"}, "rules": {}, ' \
+           '"default_rule": {"clause": "X", "detail": "d"}}'
+    (tmp_path / "b_edition.json").write_text(good % ("B판", 2), encoding="utf-8")
+    (tmp_path / "a_edition.json").write_text(good % ("A판", 1), encoding="utf-8")
+    entries = list_criteria(tmp_path)
+    assert [e["id"] for e in entries] == ["a_edition", "b_edition"]
+    assert entries[0]["name"] == "A판" and entries[0]["version"] == "v1"
+    assert entries[0]["edition_note"] == ""  # 없으면 빈 문자열
+    (tmp_path / "broken.json").write_text("{ 깨짐", encoding="utf-8")
+    with pytest.raises(ValueError):
+        list_criteria(tmp_path)  # 조용히 건너뛰지 않는다
+    (tmp_path / "broken.json").write_text('{"rules": {}}', encoding="utf-8")  # meta 누락
+    with pytest.raises(ValueError):
+        list_criteria(tmp_path)

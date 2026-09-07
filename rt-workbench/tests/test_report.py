@@ -17,6 +17,7 @@ from rtworkbench.models import (
     InspectionContext,
     InspectionRecord,
     Measurement,
+    ReportDetails,
     RuleVerdict,
 )
 from rtworkbench.report_llm import ReportWriter, build_payload, template_report
@@ -410,3 +411,107 @@ def test_build_pdf_with_group_verdict(context, verdicts):
     )
     pdf = build_pdf(rec)
     assert pdf.startswith(b"%PDF") and len(pdf) > 1500
+
+
+# ---------------------------------------------------------------- 적용 기준표(규격 판본) 표기
+
+
+def _pdf_text(pdf: bytes) -> str:
+    pymupdf = pytest.importorskip("pymupdf")
+    return "".join(page.get_text() for page in pymupdf.open(stream=pdf, filetype="pdf"))
+
+
+def test_build_pdf_footer_carries_criteria_name_and_version(record):
+    record.criteria_name = "데모 기준표 — 판본 테스트"
+    record.criteria_version = "9.9-test"
+    text = _pdf_text(build_pdf(record))
+    assert "적용 기준표" in text
+    assert "데모 기준표 — 판본 테스트" in text and "9.9-test" in text
+    assert "데모 기준" in text  # 데모 기준표 디스클레이머는 그대로
+
+
+def test_build_pdf_legacy_record_without_criteria_is_marked_unrecorded(record):
+    assert record.criteria_name == "" and record.criteria_label == ""  # 판본 분리 전 기록
+    text = _pdf_text(build_pdf(record))
+    assert "미기록" in text
+
+
+# ---------------------------------------------------------------- 선급 보고 항목 (IACS UR W33 §8)
+
+
+def _filled_report() -> ReportDetails:
+    return ReportDetails(
+        hull_number="H-2031", personnel_qualification="ISO 9712 RT Level 2",
+        steel_grade="AH36", repairs_count=3,
+        source_type_size="Ir-192, 2x2 mm", xray_kv="200", sfd_mm="700",
+        iqi_sensitivity="W13 (1.6%)", density="2.3~2.8", rt_acceptance_class="ISO 10675-1 Level 1",
+    )
+
+
+def test_build_payload_has_conditions_section_only_when_report_filled(context, verdicts, measurements):
+    """'[촬영 조건]' 섹션은 입력된 보고 항목이 있을 때만, 입력된 항목만 실린다."""
+    assert context.report.is_empty()
+    empty = build_payload(context, verdicts, measurements)
+    assert "[촬영 조건]" not in empty and "선체 번호" not in empty
+
+    context.report = _filled_report()
+    payload = build_payload(context, verdicts, measurements)
+    assert "[촬영 조건]" in payload
+    assert "선체 번호: H-2031" in payload
+    assert "검사자 자격 등급: ISO 9712 RT Level 2" in payload
+    assert "보수 횟수(2회 초과 시): 3회" in payload
+    assert "X선 관전압: 200 kV" in payload and "선원-필름 거리(SFD): 700 mm" in payload
+    assert "농도: 2.3~2.8" in payload and "RT 합격 등급: ISO 10675-1 Level 1" in payload
+    assert "용접 방법" not in payload  # 미입력 항목은 나열하지 않는다
+    # 섹션 순서: 검사 개요 → 촬영 조건 → 결함별 판정 → 종합 판정
+    assert payload.index("[검사 개요]") < payload.index("[촬영 조건]") < payload.index("[결함별 판정]")
+    # 비식별 원칙은 그대로 — 검사원 실명은 여전히 제외
+    assert INSPECTOR_NAME not in payload
+
+
+def test_build_payload_report_fields_do_not_change_verdict_lines(context, verdicts, measurements):
+    """보고 항목은 문서 전용 — 결함별 판정/종합 판정 섹션 텍스트는 바뀌지 않는다."""
+    before = build_payload(context, verdicts, measurements)
+    context.report = _filled_report()
+    after = build_payload(context, verdicts, measurements)
+    tail = lambda s: s[s.index("[결함별 판정]"):]  # noqa: E731
+    assert tail(before) == tail(after)
+
+
+def test_template_report_carries_conditions_under_overview(context, verdicts, measurements):
+    context.report = _filled_report()
+    report = template_report(build_payload(context, verdicts, measurements))
+    assert "촬영 조건 (IACS UR W33 §8 보고 항목)" in report
+    assert "선체 번호: H-2031" in report
+    assert report.index("1. 검사 개요") < report.index("선체 번호") < report.index("2. 결함 소견")
+    # 비어 있으면 그 소제목도 없다
+    context.report = ReportDetails()
+    assert "촬영 조건" not in template_report(build_payload(context, verdicts, measurements))
+
+
+def test_build_pdf_report_section_present_only_when_filled(record):
+    """PDF '5. 선급 보고 항목' 섹션 — 입력이 있을 때만, 입력된 항목만 + n/25 표기."""
+    assert record.context.report.is_empty()
+    text = _pdf_text(build_pdf(record))
+    assert "5. 선급 보고 항목" not in text
+    # 기존 섹션은 그대로
+    for section in ("1. 검사 정보", "2. 결함 판정", "3. 종합 판정", "4. 소견서 본문", "적용 기준표"):
+        assert section in text
+
+    record.context.report = _filled_report()
+    pdf = build_pdf(record)
+    assert pdf.startswith(b"%PDF")
+    text = _pdf_text(pdf)
+    assert "5. 선급 보고 항목(IACS UR W33 §8)" in text
+    assert "입력 항목 10/25" in text
+    assert "일반 항목 (§8.2)" in text and "RT 촬영 조건 (§8.5)" in text
+    assert "H-2031" in text and "Hull number" in text  # 한국어 라벨 + W33 원문 병기
+    assert "ISO 9712 RT Level 2" in text and "3회" in text
+    assert "200 kV" in text and "700 mm" in text and "2.3~2.8" in text
+    assert "용접 방법" not in text and "Welding process" not in text  # 미입력 항목 생략
+    for section in ("1. 검사 정보", "2. 결함 판정", "3. 종합 판정", "4. 소견서 본문", "적용 기준표"):
+        assert section in text
+    # 가운뎃점(U+00B7)은 내장 CID 폰트에 글리프가 없어 사라지므로 아래아(U+318D)로 렌더링된다
+    assert "선원 종류ㆍ크기" in text and "선원 종류크기" not in text
+    assert "입력 항목 10/25 ㆍ 판정에" in text  # 캡션의 가운뎃점도 동일 처리
+    assert "표시ㆍ문서화" in text  # 기존 푸터('후보 표시·문서화')도 더 이상 글자가 빠지지 않는다

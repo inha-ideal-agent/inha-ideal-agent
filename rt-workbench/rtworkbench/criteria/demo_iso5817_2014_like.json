@@ -1,9 +1,10 @@
 {
   "meta": {
-    "name": "데모 기준표 — ISO 5817:2023/ISO 10675-1:2021 구조 모사(2028.01 이후 건조계약분용)",
-    "version": "0.2-demo-2023",
-    "edition_note": "ISO 5817:2023/ISO 10675-1:2021 구조 모사 — IACS UR W33 Rev.2, 2028.01.01 이후 건조계약분",
-    "disclaimer": "본 기준표의 수치는 ISO 5817:2023/ISO 10675-1:2021 계열의 '구조'를 모사한 데모 값이며 실제 규격 원문의 수치가 아닙니다. 판본 구분(2023/2021 vs 2014/2016)도 구조 시연용이며, 실제 건조 선체의 생산 검사 합부 기준은 선급 NDT 지침 확인 및 도메인 멘토링으로 확정한 뒤, 이 JSON 파일만 교체하면 됩니다(룰 엔진 코드는 데이터 주도 설계로 무변경). 2028.01.01 이전 건조계약분은 demo_iso5817_2014_like.json(사이드바에서 선택)을 사용합니다.",
+    "name": "데모 기준표 — ISO 5817:2014/ISO 10675-1:2016 구조 모사(2028.01 이전 건조계약분용)",
+    "version": "0.2-demo-2014",
+    "edition_note": "ISO 5817:2014/ISO 10675-1:2016 구조 모사 — IACS UR W33 Rev.2 적용 전, 2028.01.01 이전 건조계약분",
+    "disclaimer": "본 기준표의 수치는 ISO 5817:2014/ISO 10675-1:2016 계열의 '구조'를 모사한 데모 값이며 실제 규격 원문의 수치가 아닙니다. 판본 구분(2014/2016 vs 2023/2021)도 구조 시연용이며, 실제 건조 선체의 생산 검사 합부 기준은 선급 NDT 지침 확인 및 도메인 멘토링으로 확정한 뒤, 이 JSON 파일만 교체하면 됩니다(룰 엔진 코드는 데이터 주도 설계로 무변경).",
+    "demo_differences": "2023/2021 구조 데모(demo_iso5817_like.json)와의 의도적 차이 — 판본 전환이 판정에 반영됨을 시연하기 위한 데모 값: (1) 기공 단일 한계 계수/cap 완화 (B 0.25/3.5, C 0.3/4.5, D 0.35/5.5) (2) 기공 투영 면적률 한계 완화 (B 1.5%, C 2.0%, D 2.5%) (3) 언더컷 D cap 1.5mm (4) 조항 표기 접두어 DEMO14-",
     "quality_levels": ["B", "C", "D"],
     "limit_formula": "limit_mm = min(coef_thickness × 모재두께 t, cap_mm); permitted=false이면 크기와 무관하게 허용 불가",
     "group_formulas": {
@@ -14,27 +15,27 @@
   },
   "rules": {
     "porosity": {
-      "clause": "DEMO-2011",
+      "clause": "DEMO14-2011",
       "name_ko": "기공(단일)",
       "dimension": "최대 치수 d",
       "levels": {
-        "B": { "permitted": true, "coef_thickness": 0.2, "cap_mm": 3.0 },
-        "C": { "permitted": true, "coef_thickness": 0.25, "cap_mm": 4.0 },
-        "D": { "permitted": true, "coef_thickness": 0.3, "cap_mm": 5.0 }
+        "B": { "permitted": true, "coef_thickness": 0.25, "cap_mm": 3.5 },
+        "C": { "permitted": true, "coef_thickness": 0.3, "cap_mm": 4.5 },
+        "D": { "permitted": true, "coef_thickness": 0.35, "cap_mm": 5.5 }
       },
       "group": {
         "mode": "area_ratio",
-        "clause": "DEMO-2012-AREA",
+        "clause": "DEMO14-2012-AREA",
         "name_ko": "기공 투영 면적률",
         "levels": {
-          "B": { "limit_pct": 1.0 },
-          "C": { "limit_pct": 1.5 },
-          "D": { "limit_pct": 2.0 }
+          "B": { "limit_pct": 1.5 },
+          "C": { "limit_pct": 2.0 },
+          "D": { "limit_pct": 2.5 }
         }
       }
     },
     "cluster_porosity": {
-      "clause": "DEMO-2013",
+      "clause": "DEMO14-2013",
       "name_ko": "군집 기공",
       "dimension": "군집 포락 치수 dA",
       "levels": {
@@ -44,7 +45,7 @@
       }
     },
     "crack": {
-      "clause": "DEMO-100",
+      "clause": "DEMO14-100",
       "name_ko": "균열",
       "dimension": "길이 l",
       "levels": {
@@ -54,7 +55,7 @@
       }
     },
     "lack_of_fusion": {
-      "clause": "DEMO-401",
+      "clause": "DEMO14-401",
       "name_ko": "융합불량",
       "dimension": "길이 l",
       "levels": {
@@ -64,7 +65,7 @@
       },
       "group": {
         "mode": "cumulative_length",
-        "clause": "DEMO-401-CUM",
+        "clause": "DEMO14-401-CUM",
         "name_ko": "융합불량 누적 길이",
         "levels": {
           "B": { "permitted": false },
@@ -74,7 +75,7 @@
       }
     },
     "incomplete_penetration": {
-      "clause": "DEMO-402",
+      "clause": "DEMO14-402",
       "name_ko": "용입부족",
       "dimension": "길이 l",
       "levels": {
@@ -84,7 +85,7 @@
       },
       "group": {
         "mode": "cumulative_length",
-        "clause": "DEMO-402-CUM",
+        "clause": "DEMO14-402-CUM",
         "name_ko": "용입부족 누적 길이",
         "levels": {
           "B": { "permitted": false },
@@ -94,7 +95,7 @@
       }
     },
     "slag_inclusion": {
-      "clause": "DEMO-301",
+      "clause": "DEMO14-301",
       "name_ko": "슬래그 개재물",
       "dimension": "높이/폭 h",
       "levels": {
@@ -104,7 +105,7 @@
       },
       "group": {
         "mode": "cumulative_length",
-        "clause": "DEMO-302-CUM",
+        "clause": "DEMO14-302-CUM",
         "name_ko": "슬래그 개재물 누적 길이",
         "levels": {
           "B": { "permitted": true, "coef_thickness": 0.5, "cap_mm": 12.5 },
@@ -114,18 +115,18 @@
       }
     },
     "undercut": {
-      "clause": "DEMO-5011",
+      "clause": "DEMO14-5011",
       "name_ko": "언더컷",
       "dimension": "깊이 h",
       "levels": {
         "B": { "permitted": true, "coef_thickness": 0.05, "cap_mm": 0.5 },
         "C": { "permitted": true, "coef_thickness": 0.1, "cap_mm": 0.5 },
-        "D": { "permitted": true, "coef_thickness": 0.2, "cap_mm": 1.0 }
+        "D": { "permitted": true, "coef_thickness": 0.2, "cap_mm": 1.5 }
       }
     }
   },
   "default_rule": {
-    "clause": "DEMO-UNLISTED",
+    "clause": "DEMO14-UNLISTED",
     "name_ko": "기준표 미등재 유형",
     "fail_safe": true,
     "detail": "기준표에 등재되지 않은 결함 유형입니다. 안전 우선(fail-safe) 원칙에 따라 자동 합격 처리하지 않으며, 판독원의 수동 판정 및 기준표 보완이 필요합니다."

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
 APP_PATH = Path(__file__).resolve().parent.parent / "app.py"
@@ -156,3 +157,356 @@ def test_judgment_appends_group_verdict_using_sidebar_eval_window():
     g = verdicts[-1]
     assert g.unit == "%" and "평가길이 50mm × 용접부 폭 10mm" in g.detail
     assert at.session_state["wb_overall"] is True
+
+
+# ─────────────── 선급 보고 항목(IACS UR W33 §8.2·8.5) — 사이드바 expander ───────────────
+
+REPORT_EXPANDER_LABEL = "선급 보고 항목(IACS UR W33 §8.2·8.5)"
+
+
+def _coverage_caption(at) -> str:
+    return next(c.value for c in at.caption if c.value.startswith("📋 선급 보고 항목"))
+
+
+def test_report_details_expander_exists_and_coverage_caption_renders():
+    """사이드바 expander(접힘)에 25개 입력 위젯이 있고 '선급 보고 항목 n/25 입력' 캡션이 보인다."""
+    from rtworkbench.models import REPORT_ITEMS
+
+    at = AppTest.from_file(str(APP_PATH))
+    at.run(timeout=60)
+    assert not at.exception
+    exp = next(e for e in at.expander if e.label == REPORT_EXPANDER_LABEL)
+    assert exp.proto.expanded is False  # 기본 접힘
+    assert _coverage_caption(at) == "📋 선급 보고 항목 0/25 입력"
+    # 항목마다 위젯 1개 — 보수 횟수만 number_input, 나머지는 text_input (help 에 W33 원문)
+    for item in REPORT_ITEMS:
+        key = f"wb_rpt_{item.key}"
+        if item.key == "repairs_count":
+            w = at.number_input(key=key)
+            assert w.value == 0
+        else:
+            w = at.text_input(key=key)
+            assert w.value == ""
+            assert item.label_en in (w.help or "")
+        assert item.label_ko in w.label
+
+    at.text_input(key="wb_rpt_hull_number").set_value("H-2031")
+    at.text_input(key="wb_rpt_sfd_mm").set_value("700")
+    at.number_input(key="wb_rpt_repairs_count").set_value(3)
+    at.run(timeout=60)
+    assert not at.exception
+    assert _coverage_caption(at) == "📋 선급 보고 항목 3/25 입력"
+
+
+def test_report_details_do_not_invalidate_judgment_but_flow_into_record(monkeypatch, tmp_path):
+    """보고 항목 변경은 판정을 무효화하지 않고(룰 입력 아님), 승인 기록·PDF에는 실린다."""
+    from rtworkbench import db as archive_db
+    from rtworkbench.models import DefectCandidate, Measurement
+
+    # 앱은 archive_db.Archive() 를 기본 인자(config.DB_PATH — import 시점에 고정)로 부른다.
+    # 실제 data/ DB 를 건드리지 않도록 기본 DB 경로를 임시 파일로 바꾼다.
+    Archive = archive_db.Archive
+    orig_init = Archive.__init__
+    monkeypatch.setattr(
+        Archive, "__init__",
+        lambda self, db_path=tmp_path / "t.db": orig_init(self, db_path),
+    )
+    at = _boot_with_image()
+    at.session_state["wb_candidates"] = [
+        DefectCandidate(id="p1", defect_type="porosity", bbox=(10, 10, 30, 30),
+                        confidence=1.0, source="human", status="accepted"),
+    ]
+    at.session_state["wb_measurements"] = {
+        "p1": Measurement(defect_id="p1", p1=(0.0, 0.0), p2=(0.0, 20.0),
+                          length_px=20.0, length_mm=2.0),
+    }
+    at.session_state["wb_scale_mm_per_px"] = 0.1
+    at.run(timeout=60)
+    _button(at, "wb_btn_judge").click()
+    at.run(timeout=60)
+    assert at.session_state["wb_overall"] is True
+    verdicts_before = [v.to_dict() for v in at.session_state["wb_verdicts"]]
+    at.session_state["wb_pdf_bytes"] = b"%PDF-stale"  # 미리 생성해 둔 PDF
+
+    at.text_input(key="wb_rpt_hull_number").set_value("H-2031")
+    at.text_input(key="wb_rpt_xray_kv").set_value("200")
+    at.run(timeout=60)
+    assert not at.exception
+    assert at.session_state["wb_overall"] is True  # 판정 유지
+    assert [v.to_dict() for v in at.session_state["wb_verdicts"]] == verdicts_before
+    assert at.session_state["wb_pdf_bytes"] is None  # 낡은 PDF만 버린다
+    assert _coverage_caption(at) == "📋 선급 보고 항목 2/25 입력"
+
+    _button(at, "wb_btn_approve").click()
+    at.run(timeout=60)
+    assert not at.exception
+    rec = Archive(tmp_path / "t.db").get(at.session_state["wb_record_id"])
+    assert rec is not None
+    assert rec.context.report.hull_number == "H-2031" and rec.context.report.xray_kv == "200"
+    assert rec.context.report.coverage() == (2, 25)
+    pdf = at.session_state["wb_pdf_bytes"]
+    assert pdf and pdf.startswith(b"%PDF")
+    pymupdf = pytest.importorskip("pymupdf")
+    text = "".join(pg.get_text() for pg in pymupdf.open(stream=pdf, filetype="pdf"))
+    assert "5. 선급 보고 항목" in text and "H-2031" in text and "200 kV" in text
+
+
+# ─────────────── 기준표(규격 판본) 선택 — 사이드바 selectbox ───────────────
+
+CRITERIA_2023 = "demo_iso5817_like"
+CRITERIA_2014 = "demo_iso5817_2014_like"
+
+
+def test_criteria_selectbox_exists_with_default_2023():
+    """사이드바 '기준표(규격 판본)' selectbox — 기본 선택은 2023/2021 구조 데모(config.CRITERIA_PATH)."""
+    at = AppTest.from_file(str(APP_PATH))
+    at.run(timeout=60)
+    assert not at.exception
+    sb = at.selectbox(key="wb_criteria_id")
+    assert sb.label == "기준표(규격 판본)"
+    assert at.session_state["wb_criteria_id"] == CRITERIA_2023
+    assert len(sb.options) >= 2  # 두 판본 모두 목록에 있고, 표시는 meta.name
+    assert any("2023" in o for o in sb.options) and any("2014" in o for o in sb.options)
+    assert any("📐" in c.value and "2023" in c.value for c in at.caption)  # 판본 메모 캡션
+
+
+def test_criteria_change_invalidates_judgment():
+    """회귀 방지: 판정 후 기준표(규격 판본) 변경 시 기존 verdict/overall 무효화."""
+    at = _boot_with_image()
+    at.session_state["wb_overall"] = True
+    at.run(timeout=60)
+    at.selectbox(key="wb_criteria_id").select(CRITERIA_2014)
+    at.run(timeout=60)
+    assert not at.exception
+    assert at.session_state["wb_criteria_id"] == CRITERIA_2014
+    assert at.session_state["wb_overall"] is None
+    assert at.session_state["wb_verdicts"] == []
+    assert at.session_state["wb_criteria_used"] is None
+
+
+def test_judgment_uses_selected_criteria_and_pdf_carries_it():
+    """판정은 선택된 판본의 JSON으로 — 같은 결함이 2023 구조에선 불합격, 2014 구조에선 합격."""
+    from rtworkbench.models import DefectCandidate, Measurement
+
+    at = _boot_with_image()
+    at.session_state["wb_candidates"] = [
+        DefectCandidate(id="p1", defect_type="porosity", bbox=(10, 10, 30, 30),
+                        confidence=1.0, source="human", status="accepted"),
+    ]
+    at.session_state["wb_measurements"] = {
+        "p1": Measurement(defect_id="p1", p1=(0.0, 0.0), p2=(0.0, 28.0),
+                          length_px=28.0, length_mm=2.8),
+    }
+    at.session_state["wb_scale_mm_per_px"] = 0.1  # 28px → 2.8mm ; t=12, B
+    at.run(timeout=60)
+
+    _button(at, "wb_btn_judge").click()
+    at.run(timeout=60)
+    assert not at.exception
+    v = at.session_state["wb_verdicts"][0]
+    assert (v.limit_mm, v.passed, v.clause) == (2.4, False, "DEMO-2011")
+    used = at.session_state["wb_criteria_used"]
+    assert used["id"] == CRITERIA_2023 and "2023" in used["name"] and used["version"]
+    assert any("적용 기준표" in c.value and "2023" in c.value for c in at.caption)
+
+    at.selectbox(key="wb_criteria_id").select(CRITERIA_2014)
+    at.run(timeout=60)
+    assert at.session_state["wb_overall"] is None  # 판본 변경 → 재판정 필요
+    _button(at, "wb_btn_judge").click()
+    at.run(timeout=60)
+    assert not at.exception
+    v = at.session_state["wb_verdicts"][0]
+    assert (v.limit_mm, v.passed, v.clause) == (3.0, True, "DEMO14-2011")
+    assert at.session_state["wb_overall"] is True
+    assert at.session_state["wb_criteria_used"]["id"] == CRITERIA_2014
+
+    # PDF(승인 전 미리 생성)에도 적용 기준표가 실린다
+    _button(at, "wb_btn_pdf_preview").click()
+    at.run(timeout=60)
+    assert not at.exception
+    pdf = at.session_state["wb_pdf_bytes"]
+    assert pdf and pdf.startswith(b"%PDF")
+    pymupdf = pytest.importorskip("pymupdf")  # PDF 본문 추출 — 미설치 환경에선 여기까지만 검증
+    text = "".join(pg.get_text() for pg in pymupdf.open(stream=pdf, filetype="pdf"))
+    assert "적용 기준표" in text and "2014" in text and "0.2-demo-2014" in text
+
+
+# ─────────────── 📖 기준표·정보 탭 — 용어 풀이 · 참고 자료 · 제안서 문구 정렬 ───────────────
+
+README_PATH = APP_PATH.parent / "README.md"
+
+
+def _all_text(elements) -> str:
+    return "\n".join(e.value for e in elements)
+
+
+def test_info_tab_renders_glossary_and_references_without_exception():
+    """정보 탭: 맨 위 용어 풀이 캡션(8줄 이내)과 맨 끝 '참고 자료' 절이 예외 없이 렌더된다."""
+    at = AppTest.from_file(str(APP_PATH))
+    at.run(timeout=60)
+    assert not at.exception, f"정보 탭 렌더 중 예외: {at.exception}"
+
+    glossary = next(c.value for c in at.caption if "이 프로토타입은 무엇이고 무엇이 아닌가" in c.value)
+    assert len([ln for ln in glossary.strip().splitlines() if ln.strip()]) <= 8
+    for term in ("RT", "방사선투과검사", "판독", "선급", "KR", "DNV", "ABS", "IACS", "IQI"):
+        assert term in glossary, term
+
+    assert any(s.value == "참고 자료" for s in at.subheader)
+    refs = next(m.value for m in at.markdown if "**규칙·규격**" in m.value)
+    for group in ("**규칙·규격**", "**데이터셋**", "**논문**", "**도구**"):
+        assert group in refs, group
+    for key in ("IACS UR W33 Rev.1/Corr.1", "IACS UR W33 Rev.2", "2026.07.15", "2028.01.01", "100 mm",
+                "ISO 10675-1:2021", "ISO 5817:2023", "ISO 17636-1/-2:2022", "ISO 14096-2", "ISO 9712:2021",
+                "GDXray", "RIAWELC", "AI Hub 71761", "WeldVGG", "Palma-Ramírez", "Lu et al.",
+                "YOLO26", "AGPL-3.0", "Streamlit", "Ollama", "vLLM", "EXAONE 3.5", "HyperCLOVA X SEED"):
+        assert key in refs, key
+    # 검색 스니펫으로만 확인한 항목은 표시가 붙는다
+    assert "HyperCLOVA X SEED — NAVER 한국어 모델 후보 (검색 요약 기준)" in refs
+    # AI Hub 수치는 활용 신청 시 데이터셋 페이지에서 확인한 값 — 계획서 S04와 같은 확인 상태(검색 요약 아님)
+    aihub_line = refs.split("AI Hub 71761", 1)[1].splitlines()[0]
+    assert "활용 신청 시 데이터셋 페이지에서 확인" in aihub_line and "검색 요약 기준" not in aihub_line
+
+
+def test_references_list_matches_readme():
+    """앱의 참고 자료 번호 항목은 README.md '## 참고 자료' 절과 한 줄도 다르지 않다."""
+    at = AppTest.from_file(str(APP_PATH))
+    at.run(timeout=60)
+    refs = next(m.value for m in at.markdown if "**규칙·규격**" in m.value)
+    numbered = [ln.strip() for ln in refs.splitlines() if ln.strip()[:2].rstrip(".").isdigit()]
+    assert len(numbered) == 18
+
+    readme = README_PATH.read_text(encoding="utf-8")
+    assert "## 참고 자료" in readme
+    readme_section = readme.split("## 참고 자료", 1)[1]
+    for line in numbered:
+        assert line in readme_section, line
+
+
+def test_info_tab_copy_matches_proposal_deck():
+    """설계 원칙·탐지 백엔드·LLM 정책 문구가 제안서 문구와 일치한다."""
+    at = AppTest.from_file(str(APP_PATH))
+    at.run(timeout=60)
+    assert not at.exception
+
+    principles = next(m.value for m in at.markdown if "**1. AI는 판정하지 않는다.**" in m.value)
+    # 원칙 2는 계획서 S01 문구("기존 사진·기존 절차 위에")와 같은 낱말을 쓴다 — 사이드바 캡션도 동일
+    assert "**2. 기존 사진·기존 절차 위에.**" in principles
+    assert "스캔한 필름 사진 또는 디지털 RT(CR/DR) 사진" in principles
+    assert any("② 기존 사진·기존 절차 위에" in c.value for c in at.caption)
+    assert "ISO 14096-2" in principles and "조직 단위 전제조건" in principles
+
+    captions = _all_text(at.caption)
+    # 탐지 백엔드: 폴백은 학습 모델이 아닌 OpenCV 휴리스틱, YOLO 가중치(YOLO26s 권장)로 자동 전환
+    det = next(c.value for c in at.caption if "OpenCV" in c.value and "YOLO26s" in c.value)
+    assert "학습된 모델이 아닌" in det and "자동으로 YOLO 백엔드로 전환" in det
+    # LLM 정책: 로컬 기본 모델 EXAONE 3.5(exaone3.5:7.8b), 클라우드는 옵트인
+    llm = next(c.value for c in at.caption if "EXAONE 3.5" in c.value)
+    assert "exaone3.5:7.8b" in llm and "옵트인" in llm and "RTWB_ALLOW_CLOUD_LLM=1" in llm
+    assert "이 프로토타입은 무엇이고 무엇이 아닌가" in captions
+
+    # 정책 표(st.table)에도 옵트인·기본 모델 표기가 실린다
+    tables = "\n".join(t.value.to_string() for t in at.table)
+    assert "옵트인" in tables
+    assert "EXAONE 3.5" in tables  # 기본 모델(exaone3.5:7.8b)일 때 주석 표기
+
+
+# ─────────────── 초안 생성 이후 보고 항목 변경 — 낡은 초안 표시 ───────────────
+
+
+def test_report_item_edit_after_draft_marks_draft_stale_and_clears_payload():
+    """초안 생성 뒤 보고 항목을 바꾸면 payload·생성 경로는 비워지고, 본문은 남되 '초안을 다시 생성' 경고가 뜬다.
+
+    (이전에는 PDF만 버려서, 소견서 본문 4절의 '[촬영 조건]' 값과 PDF 5절 표의 값이 어긋난 채
+    승인·아카이브될 수 있었다.)
+    """
+    from rtworkbench.models import DefectCandidate, Measurement
+
+    at = _boot_with_image()
+    at.session_state["wb_candidates"] = [
+        DefectCandidate(id="p1", defect_type="porosity", bbox=(10, 10, 30, 30),
+                        confidence=1.0, source="human", status="accepted"),
+    ]
+    at.session_state["wb_measurements"] = {
+        "p1": Measurement(defect_id="p1", p1=(0.0, 0.0), p2=(0.0, 20.0),
+                          length_px=20.0, length_mm=2.0),
+    }
+    at.session_state["wb_scale_mm_per_px"] = 0.1
+    at.text_input(key="wb_rpt_sfd_mm").set_value("700")
+    at.run(timeout=60)
+    _button(at, "wb_btn_judge").click()
+    at.run(timeout=60)
+    assert at.session_state["wb_overall"] is True
+    _button(at, "wb_btn_report").click()
+    at.run(timeout=60)
+    assert not at.exception
+    assert "700 mm" in at.session_state["wb_report_payload"]
+    assert "700 mm" in at.session_state["wb_report_text"]
+    assert at.session_state["wb_report_source"]
+    assert at.session_state["wb_report_stale"] is False
+    assert not any("초안 생성 이후" in w.value for w in at.warning)
+
+    # 보고 항목 수정 → 판정은 유지, payload·경로는 비움, 본문은 남김 + 경고
+    at.text_input(key="wb_rpt_sfd_mm").set_value("800")
+    at.run(timeout=60)
+    assert not at.exception
+    assert at.session_state["wb_overall"] is True
+    assert at.session_state["wb_report_payload"] == ""
+    assert at.session_state["wb_report_source"] == ""
+    assert at.session_state["wb_pdf_bytes"] is None
+    assert "700 mm" in at.session_state["wb_report_text"]  # 편집 중일 수 있는 본문은 보존
+    assert at.session_state["wb_report_stale"] is True
+    stale = [w.value for w in at.warning if "초안 생성 이후" in w.value]
+    assert stale and "초안 생성" in stale[0] and "보고 항목" in stale[0]
+
+    # 다시 초안 생성 → 새 값 반영, 경고 사라짐
+    _button(at, "wb_btn_report").click()
+    at.run(timeout=60)
+    assert not at.exception
+    assert "800 mm" in at.session_state["wb_report_payload"]
+    assert "800 mm" in at.session_state["wb_report_text"] and "700 mm" not in at.session_state["wb_report_text"]
+    assert at.session_state["wb_report_stale"] is False
+    assert not any("초안 생성 이후" in w.value for w in at.warning)
+
+
+def test_judgment_input_change_after_draft_marks_draft_stale():
+    """초안 생성 뒤 판정 입력(두께)이 바뀌면 판정은 무효화되고, 남은 본문에는 낡음 경고가 붙는다.
+
+    초안이 없던 상태(직접 쓴 본문)에서는 경고가 붙지 않는다.
+    """
+    from rtworkbench.models import DefectCandidate, Measurement
+
+    at = _boot_with_image()
+    at.session_state["wb_report_text"] = "직접 작성한 소견"  # 초안 없이 손으로 쓴 본문
+    at.session_state["wb_candidates"] = [
+        DefectCandidate(id="p1", defect_type="porosity", bbox=(10, 10, 30, 30),
+                        confidence=1.0, source="human", status="accepted"),
+    ]
+    at.session_state["wb_measurements"] = {
+        "p1": Measurement(defect_id="p1", p1=(0.0, 0.0), p2=(0.0, 20.0),
+                          length_px=20.0, length_mm=2.0),
+    }
+    at.session_state["wb_scale_mm_per_px"] = 0.1
+    at.run(timeout=60)
+    _button(at, "wb_btn_judge").click()
+    at.run(timeout=60)
+    at.number_input(key="wb_ctx_thickness").set_value(20.0)
+    at.run(timeout=60)
+    assert at.session_state["wb_overall"] is None
+    assert at.session_state["wb_report_stale"] is False  # 생성한 초안이 없었으므로 경고 없음
+    assert not any("초안 생성 이후" in w.value for w in at.warning)
+
+    _button(at, "wb_btn_judge").click()
+    at.run(timeout=60)
+    _button(at, "wb_btn_report").click()
+    at.run(timeout=60)
+    assert at.session_state["wb_report_payload"]
+    at.number_input(key="wb_ctx_thickness").set_value(25.0)
+    at.run(timeout=60)
+    assert at.session_state["wb_overall"] is None
+    assert at.session_state["wb_report_stale"] is True
+    assert any("초안 생성 이후" in w.value for w in at.warning)
+
+    # 새 이미지 로드 → 본문과 함께 낡음 표시도 사라진다
+    at.session_state["wb_image_key"] = "test:another"
+    at.session_state["wb_image_name"] = "another.png"
+    at.run(timeout=60)

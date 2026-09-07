@@ -14,7 +14,11 @@ EXPORTS_DIR = DATA_DIR / "exports"
 DB_PATH = Path(os.environ.get("RTWB_DB_PATH", DATA_DIR / "rt_workbench.db"))
 LLM_CACHE_PATH = DATA_DIR / "llm_cache.json"
 
-CRITERIA_PATH = PACKAGE_DIR / "criteria" / "demo_iso5817_like.json"
+# 기준표(규격 판본별 JSON) 디렉터리 — *.json 하나가 판본 하나. 파일 추가/교체만으로 대응(룰 엔진 무변경).
+CRITERIA_DIR = PACKAGE_DIR / "criteria"
+# 기본 기준표 = ISO 5817:2023/ISO 10675-1:2021 구조 데모 (2028.01.01 이후 건조계약분).
+# 2028.01 이전 건조계약분용 2014/2016 구조 데모는 같은 디렉터리의 demo_iso5817_2014_like.json.
+CRITERIA_PATH = CRITERIA_DIR / "demo_iso5817_like.json"
 
 # YOLO 가중치가 이 경로에 있으면 YoloDetector가 사용된다. 없으면 CV 폴백 탐지기.
 YOLO_WEIGHTS_PATH = Path(os.environ.get("RTWB_YOLO_WEIGHTS", PROJECT_DIR / "weights" / "best.pt"))

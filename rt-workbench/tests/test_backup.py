@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from rtworkbench.db import Archive
@@ -118,3 +120,21 @@ def test_legacy_db_migration(tmp_path):
     db = Archive(path)  # ALTER로 컬럼 추가되어야 함
     db.save(_record("r1", elapsed=42.0))
     assert db.get("r1").elapsed_seconds == 42.0
+
+
+def test_criteria_name_version_roundtrip_and_legacy_json(tmp_path):
+    """적용 기준표 이름/버전은 DB 왕복·백업 JSON에 보존되고, 없는 구버전 JSON은 ''로 파싱된다."""
+    db = Archive(tmp_path / "t.db")
+    rec = _record("rec-crit", elapsed=None)
+    rec.criteria_name = "데모 기준표 — 판본 A"
+    rec.criteria_version = "0.2-demo-A"
+    db.save(rec)
+    got = db.get("rec-crit")
+    assert (got.criteria_name, got.criteria_version) == ("데모 기준표 — 판본 A", "0.2-demo-A")
+    assert got.criteria_label == "데모 기준표 — 판본 A (v0.2-demo-A)"
+    assert got.to_json() == rec.to_json()
+
+    legacy = json.loads(rec.to_json())
+    del legacy["criteria_name"], legacy["criteria_version"]
+    old = InspectionRecord.from_json(json.dumps(legacy, ensure_ascii=False))
+    assert old.criteria_name == "" and old.criteria_version == "" and old.criteria_label == ""

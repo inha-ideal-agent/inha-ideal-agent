@@ -28,12 +28,13 @@ from rtworkbench.models import (
     InspectionContext,
     InspectionRecord,
     Measurement,
+    ReportDetails,
     new_id,
 )
 from rtworkbench.preprocess import apply_clahe, load_grayscale
 from rtworkbench.report_llm import ReportWriter, build_payload
 from rtworkbench.report_pdf import build_pdf
-from rtworkbench.rules import RuleEngine, overall_pass
+from rtworkbench.rules import RuleEngine, list_criteria, overall_pass
 
 
 def step(msg: str) -> None:
@@ -102,19 +103,34 @@ def main() -> None:
         inspector="데모 판독원",
         scale_mm_per_px=mm_per_px,
         scale_ref=f"납마커 {mk['length_mm']:g}mm",
+        # 선급 보고 항목(IACS UR W33 §8.2·8.5) — 문서 전용, 판정에 관여하지 않는다
+        report=ReportDetails(
+            hull_number="H-2031", personnel_qualification="ISO 9712 RT Level 2",
+            steel_grade="AH36", welding_process="FCAW (136)",
+            source_type_size="Ir-192, 2.0×2.0 mm", sfd_mm="700",
+            iqi_sensitivity="W13 (1.6%)", iqi_type_position="ISO 19232-1 선형, 선원측",
+            density="2.3~2.8", rt_acceptance_class="ISO 10675-1 Level 1",
+        ),
     )
+    n_filled, n_total = context.report.coverage()
+    step(f"6-0. 선급 보고 항목 입력 {n_filled}/{n_total} (IACS UR W33 §8.2·8.5)")
+    # 기준표(규격 판본)는 JSON 파일 단위 — 기본은 config.CRITERIA_PATH(2023/2021 구조 데모).
+    # 2028.01 이전 건조계약분이면 RuleEngine("demo_iso5817_2014_like") 처럼 id만 바꾸면 된다.
     engine = RuleEngine()
+    assert engine.criteria_id in {e["id"] for e in list_criteria()}, "기준표 목록에 기본 기준표가 없음"
     items = [(c.id, c.defect_type, m.length_mm) for c, m in zip(accepted, measurements)]
     verdicts = engine.evaluate_all(items, context.thickness_mm, context.quality_level)
     ok = overall_pass(verdicts)
     step(
-        f"6. 룰 판정 완료: {len(verdicts)}건, 종합 {'합격' if ok else '불합격'} "
+        f"6. 룰 판정 완료 (기준표: {engine.criteria_label}): {len(verdicts)}건, "
+        f"종합 {'합격' if ok else '불합격'} "
         f"({sum(v.passed for v in verdicts)}건 합격 / {sum(not v.passed for v in verdicts)}건 불합격)"
     )
 
     # ---------------------------------------------------------- 7. 페이로드 + 소견서(템플릿)
     payload = build_payload(context, verdicts, measurements)
     assert "데모 판독원" not in payload, "비식별 원칙 위반: 페이로드에 검사원 실명 포함"
+    assert "[촬영 조건]" in payload and "선체 번호: H-2031" in payload, "선급 보고 항목이 payload에 없음"
     # 오프라인 템플릿 경로 강제: API 키를 비워 폴백 유도
     config.ANTHROPIC_API_KEY = ""
     config.GEMINI_API_KEY = ""
@@ -137,6 +153,8 @@ def main() -> None:
         report_source=source,
         image_name=sample_png.name,
         image_size=(w, h),
+        criteria_name=engine.criteria_name,  # 적용 기준표(규격 판본)를 기록에 남긴다
+        criteria_version=engine.criteria_version,
     )
     pdf_bytes = build_pdf(record)
     assert isinstance(pdf_bytes, bytes) and pdf_bytes.startswith(b"%PDF"), "PDF 바이트 검증 실패"
@@ -149,6 +167,8 @@ def main() -> None:
     archive.save(record)
     loaded = archive.get(record_id)
     assert loaded is not None and loaded.record_id == record_id, "저장 기록 재조회 실패"
+    assert loaded.criteria_name == engine.criteria_name, "아카이브 기록에 적용 기준표 이름이 없음"
+    assert loaded.context.report == context.report, "아카이브 기록에 선급 보고 항목이 보존되지 않음"
     step(f"9. 아카이브 저장 완료: {config.DB_PATH} (record_id={record_id})")
 
     # ---------------------------------------------------------- 10. 검색 재조회

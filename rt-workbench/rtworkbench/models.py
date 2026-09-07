@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from typing import Any
 
@@ -40,6 +40,13 @@ GROUP_ID_PREFIX = "GROUP:"
 def new_id(prefix: str = "df") -> str:
     """짧은 고유 ID 생성 (UI 표시용)."""
     return f"{prefix}-{uuid.uuid4().hex[:8]}"
+
+
+def criteria_label(name: str, version: str = "") -> str:
+    """기준표 표기 '이름 (v버전)'. 이름이 없으면 ''(기준표 미기록 — 구버전 기록)."""
+    if not name:
+        return ""
+    return f"{name} (v{version})" if version else name
 
 
 @dataclass
@@ -129,6 +136,187 @@ class RuleVerdict:
         return cls(**d)  # 구버전 기록에 unit이 없으면 기본값 'mm'
 
 
+@dataclass(frozen=True)
+class ReportItem:
+    """IACS UR W33 §8 보고 항목 1개의 메타데이터 — UI 라벨/PDF/payload/README가 공유한다."""
+
+    key: str  # ReportDetails 필드명
+    label_ko: str  # 한국어 라벨 (UI·PDF·payload)
+    label_en: str  # W33 원문 표현 (UI help 텍스트·PDF 병기)
+    group: str  # 'general'(§8.2 일반 항목) | 'rt'(§8.5 RT 촬영 조건)
+    unit: str = ""  # 표시 단위 (예: 'mm', 'kV', 's', '°') — 값 뒤에 붙인다
+    placeholder: str = ""  # UI 입력 예시
+
+
+REPORT_GROUPS: dict[str, str] = {
+    "general": "일반 항목 (§8.2)",
+    "rt": "RT 촬영 조건 (§8.5)",
+}
+
+# IACS UR W33 Rev.1/Corr.1 §8.2(일반) 중 InspectionContext에 없는 항목 + §8.5(RT 전용) 전체.
+# 이미 InspectionContext/InspectionRecord에 있는 §8.2 항목(검사일=created_at, 용접부 위치=block/weld_id,
+# 이음 종류, 모재 두께, 합격 기준=quality_level+criteria_*, 결과=verdicts, 합부=overall_passed,
+# 평가자=inspector)은 여기서 중복 입력받지 않는다.
+REPORT_ITEMS: tuple[ReportItem, ...] = (
+    # ---- §8.2 일반 항목
+    ReportItem("hull_number", "선체 번호", "Hull number", "general", placeholder="예: H-2031"),
+    ReportItem("weld_length_mm", "검사 용접 길이", "Length of weld inspected", "general",
+               unit="mm", placeholder="예: 300"),
+    ReportItem("personnel_qualification", "검사자 자격 등급",
+               "Qualification level of personnel (name/signature excluded here)", "general",
+               placeholder="예: ISO 9712 RT Level 2"),
+    ReportItem("steel_grade", "강재 등급", "Steel grade", "general", placeholder="예: AH36"),
+    ReportItem("welding_process", "용접 방법", "Welding process", "general",
+               placeholder="예: FCAW (136)"),
+    ReportItem("testing_standard", "검사 규격", "Testing standards used", "general",
+               placeholder="예: ISO 17636-1 Class B"),
+    ReportItem("equipment", "검사 장비·배치", "Testing equipment and arrangement used", "general",
+               placeholder="예: Ir-192 감마선 장비, 단벽 단상"),
+    ReportItem("limitations_viewing", "제한사항·관찰 조건·온도",
+               "Test limitations, viewing conditions and temperature", "general",
+               placeholder="예: 제한 없음, 판독기 휘도 적합, 18℃"),
+    ReportItem("repairs_count", "보수 횟수(2회 초과 시)",
+               "Number of repairs if specific area repaired more than twice", "general",
+               unit="회"),
+    # ---- §8.5 RT 전용 항목
+    ReportItem("source_type_size", "선원 종류·크기", "Type and size of radiation source", "rt",
+               placeholder="예: Ir-192, 2.0×2.0 mm"),
+    ReportItem("xray_kv", "X선 관전압", "X-ray voltage", "rt", unit="kV", placeholder="예: 200"),
+    ReportItem("film_type", "필름 종류·카세트당 매수",
+               "Type of film/designation and number of film per cassette", "rt",
+               placeholder="예: AGFA D4, 1매"),
+    ReportItem("exposures_count", "촬영 매수", "Number of radiographs (exposures)", "rt",
+               unit="매", placeholder="예: 3"),
+    ReportItem("screens", "증감지 종류", "Type of intensifying screens", "rt",
+               placeholder="예: Pb 0.1 mm 전·후면"),
+    ReportItem("exposure_technique", "촬영 기법", "Exposure technique", "rt",
+               placeholder="예: 단벽 단상 (SWSI)"),
+    ReportItem("exposure_time_s", "노출 시간", "Time of exposure", "rt", unit="s",
+               placeholder="예: 90"),
+    ReportItem("sfd_mm", "선원-필름 거리(SFD)", "Source-to-film distance", "rt", unit="mm",
+               placeholder="예: 700"),
+    ReportItem("source_to_weld_mm", "선원-용접부 거리", "Distance from radiation source to weld",
+               "rt", unit="mm", placeholder="예: 688"),
+    ReportItem("weld_to_film_mm", "용접부-필름 거리",
+               "Distance from source side of the weld to radiographic film", "rt", unit="mm",
+               placeholder="예: 12"),
+    ReportItem("beam_angle_deg", "빔 입사각(법선 기준)",
+               "Angle of radiation beam through the weld (from normal)", "rt", unit="°",
+               placeholder="예: 0"),
+    ReportItem("iqi_sensitivity", "IQI 감도", "IQI sensitivity", "rt",
+               placeholder="예: W13 (1.6%)"),
+    ReportItem("iqi_type_position", "IQI 종류·위치",
+               "Type and position of IQI (source side or film side)", "rt",
+               placeholder="예: ISO 19232-1 선형, 선원측"),
+    ReportItem("density", "농도", "Density", "rt", placeholder="예: 2.3~2.8"),
+    ReportItem("geometric_unsharpness", "기하학적 불선명도", "Geometric un-sharpness", "rt",
+               unit="mm", placeholder="예: 0.03"),
+    ReportItem("rt_acceptance_class", "RT 합격 등급", "Specific acceptance class criteria for RT",
+               "rt", placeholder="예: ISO 10675-1 Level 1"),
+)
+
+REPORT_ITEM_TOTAL: int = len(REPORT_ITEMS)  # 25 — UI 'n/25 입력' 표기의 분모
+
+# 값에 붙여 쓰는 단위 (한글 조수사·도 기호). 나머지(mm·kV·s)는 한 칸 띄운다.
+_ATTACHED_UNITS: frozenset[str] = frozenset({"회", "매", "°"})
+
+
+@dataclass
+class ReportDetails:
+    """IACS UR W33 §8.2·8.5 선급 보고 항목 (선택 입력).
+
+    판정에는 관여하지 않고 문서(PDF·소견서 payload·아카이브)에만 실린다.
+    필드 순서/이름은 REPORT_ITEMS 와 1:1 대응한다. 수치 항목도 자유 서식 문자열로 받는다
+    (예: '2.3~2.8', '700') — 보고서 그대로 옮겨 적는 용도이며 계산에 쓰지 않는다.
+    """
+
+    # §8.2 일반 항목 (InspectionContext에 없는 것)
+    hull_number: str = ""
+    weld_length_mm: str = ""
+    personnel_qualification: str = ""
+    steel_grade: str = ""
+    welding_process: str = ""
+    testing_standard: str = ""
+    equipment: str = ""
+    limitations_viewing: str = ""
+    repairs_count: int = 0  # 특정 부위 2회 초과 보수 시 횟수 — 0 = 해당 없음(미입력)
+    # §8.5 RT 전용 항목
+    source_type_size: str = ""
+    xray_kv: str = ""
+    film_type: str = ""
+    exposures_count: str = ""
+    screens: str = ""
+    exposure_technique: str = ""
+    exposure_time_s: str = ""
+    sfd_mm: str = ""
+    source_to_weld_mm: str = ""
+    weld_to_film_mm: str = ""
+    beam_angle_deg: str = ""
+    iqi_sensitivity: str = ""
+    iqi_type_position: str = ""
+    density: str = ""
+    geometric_unsharpness: str = ""
+    rt_acceptance_class: str = ""
+
+    @staticmethod
+    def _is_filled(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value > 0  # repairs_count: 0 = 해당 없음
+        return bool(str(value or "").strip())
+
+    def value_text(self, item: ReportItem) -> str:
+        """항목 값의 표시 문자열 (단위 포함). 미입력이면 ''."""
+        raw = getattr(self, item.key, "")
+        if not self._is_filled(raw):
+            return ""
+        txt = str(raw).strip()
+        if item.unit and not txt.endswith(item.unit):
+            # 한글 조수사(회·매)·도(°)는 붙여 쓰고, 단위 기호(mm·kV·s)는 띄어 쓴다
+            sep = "" if item.unit in _ATTACHED_UNITS else " "
+            txt = f"{txt}{sep}{item.unit}"
+        return txt
+
+    def filled_items(self) -> list[tuple[ReportItem, str]]:
+        """입력된 항목만 (REPORT_ITEMS 순서) → [(item, 표시 문자열)]."""
+        out: list[tuple[ReportItem, str]] = []
+        for item in REPORT_ITEMS:
+            txt = self.value_text(item)
+            if txt:
+                out.append((item, txt))
+        return out
+
+    def coverage(self) -> tuple[int, int]:
+        """(입력된 항목 수, 전체 항목 수) — UI '선급 보고 항목 n/25 입력' 표기용."""
+        return len(self.filled_items()), REPORT_ITEM_TOTAL
+
+    def is_empty(self) -> bool:
+        return not self.filled_items()
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any] | None) -> "ReportDetails":
+        """구버전 기록(키 없음/None)·미지의 키를 모두 허용한다 — 없는 항목은 기본값."""
+        if not d:
+            return cls()
+        known = {f.name for f in fields(cls)}
+        kwargs: dict[str, Any] = {}
+        for k, v in d.items():
+            if k not in known:
+                continue  # 이후 판본에서 추가된 키는 무시
+            if k == "repairs_count":
+                try:
+                    kwargs[k] = int(v or 0)
+                except (TypeError, ValueError):
+                    kwargs[k] = 0
+            else:
+                kwargs[k] = "" if v is None else str(v)
+        return cls(**kwargs)
+
+
 @dataclass
 class InspectionContext:
     """검사 1건의 메타데이터. 판독원이 사이드바에서 입력한다."""
@@ -145,13 +333,20 @@ class InspectionContext:
     scale_ref: str = ""  # 캘리브레이션 기준물 (예: "납마커 10mm")
     eval_length_mm: float = 100.0  # 평가 길이 — 누적 길이·면적률 그룹 판정의 기준 구간
     weld_width_mm: float = 20.0  # 용접부 폭 — 투영 면적(평가 길이 × 폭) 산정용
+    # 선급 보고 항목(IACS UR W33 §8.2·8.5) — 판정에 관여하지 않는 문서 전용 필드
+    report: ReportDetails = field(default_factory=ReportDetails)
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return asdict(self)  # report 는 중첩 dict 로 직렬화된다
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "InspectionContext":
-        return cls(**d)  # 구버전 기록에 eval_length_mm/weld_width_mm가 없으면 기본값
+        # 구버전 기록에 eval_length_mm/weld_width_mm/report 가 없으면 기본값
+        d = dict(d)
+        report = d.pop("report", None)
+        ctx = cls(**d)
+        ctx.report = report if isinstance(report, ReportDetails) else ReportDetails.from_dict(report)
+        return ctx
 
 
 @dataclass
@@ -170,6 +365,15 @@ class InspectionRecord:
     image_size: tuple[int, int]  # (width, height) px — 라벨 export 시 정규화에 필요
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     elapsed_seconds: float | None = None  # 이미지 로드→승인 소요시간 (창출 효과 정량화)
+    # 판정에 적용된 기준표(규격 판본) — RuleEngine.criteria_name/criteria_version.
+    # 구버전 기록(판본 분리 전)에는 없으므로 ''(미기록)을 허용한다.
+    criteria_name: str = ""
+    criteria_version: str = ""
+
+    @property
+    def criteria_label(self) -> str:
+        """적용 기준표 표기 '이름 (v버전)' — 미기록이면 ''."""
+        return criteria_label(self.criteria_name, self.criteria_version)
 
     def to_json(self) -> str:
         d = {
@@ -185,6 +389,8 @@ class InspectionRecord:
             "image_size": list(self.image_size),
             "created_at": self.created_at,
             "elapsed_seconds": self.elapsed_seconds,
+            "criteria_name": self.criteria_name,
+            "criteria_version": self.criteria_version,
         }
         return json.dumps(d, ensure_ascii=False)
 
@@ -204,4 +410,7 @@ class InspectionRecord:
             image_size=tuple(d["image_size"]),
             created_at=d["created_at"],
             elapsed_seconds=d.get("elapsed_seconds"),  # 구버전 백업엔 없음 — None 허용
+            # 판본 분리 전 기록엔 없음 — ''(미기록) 허용
+            criteria_name=str(d.get("criteria_name") or ""),
+            criteria_version=str(d.get("criteria_version") or ""),
         )

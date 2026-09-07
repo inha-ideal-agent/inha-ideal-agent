@@ -64,7 +64,8 @@ class CVFallbackDetector:
 
     recall 우선 설계: 임계는 느슨하게 잡고, confidence 순으로 상위 max_candidates 만
     제안하되, MIN_CONFIDENCE 미만의 저신뢰 후보는 제안하지 않는다(합성 필름 6장 실측:
-    임계 0.5 에서 재현율 14/14, 장당 오탐 3.8건 — 임계 없이는 장당 오탐 27.7건).
+    임계 0.5 에서 재현율 14/14, 장당 오탐 3.8건 — 임계 없이는 장당 오탐 27.7건;
+    측정 스크립트 scripts/eval_detector.py, tests/test_detection.py 가 이 수치를 대조한다).
     면적 6px 미만의 노이즈는 제외.
     """
 

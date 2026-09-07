@@ -2,13 +2,26 @@
 
 구현 계약:
 
+def list_criteria(criteria_dir: str | Path = config.CRITERIA_DIR) -> list[dict]:
+    '''기준표(규격 판본별 JSON) 목록: [{id, path, name, version, edition_note}, ...].
+    id = 파일명(stem). 기본 기준표(config.CRITERIA_PATH)가 맨 앞, 나머지는 파일명 순.
+    JSON 파싱 실패/meta 블록 누락은 ValueError — 잘못된 기준표를 조용히 숨기지 않는다.'''
+
+def resolve_criteria_path(criteria: str | Path | None = None) -> Path:
+    '''기준표 id(파일명 stem) 또는 경로 → 실제 JSON 경로. None → config.CRITERIA_PATH.
+    존재하지 않는 id → FileNotFoundError(사용 가능한 id 목록 포함).'''
+
 class RuleEngine:
     def __init__(self, criteria_path: str | Path = config.CRITERIA_PATH): ...
-        '''criteria JSON 로드. 파일 형식 오류 시 ValueError.'''
+        '''criteria JSON 로드. 기준표 id("demo_iso5817_2014_like") 또는 파일 경로 모두 허용.
+        파일 형식 오류 시 ValueError.'''
 
     @property
     def meta(self) -> dict: ...
-        '''기준표 meta 블록 (이름/버전/디스클레이머).'''
+        '''기준표 meta 블록 (이름/버전/판본 메모/디스클레이머).'''
+
+    criteria_path / criteria_id / criteria_name / criteria_version / criteria_label
+        '''로드된 기준표의 식별 정보 — 판정 기록(InspectionRecord)·PDF에 남긴다.'''
 
     def evaluate(self, defect_id: str, defect_type: str, size_mm: float,
                  thickness_mm: float, quality_level: str) -> RuleVerdict:
@@ -75,10 +88,97 @@ import math
 from pathlib import Path
 
 from rtworkbench import config
-from rtworkbench.models import DEFECT_TYPES, GROUP_ID_PREFIX, QUALITY_LEVELS, RuleVerdict
+from rtworkbench.models import (
+    DEFECT_TYPES,
+    GROUP_ID_PREFIX,
+    QUALITY_LEVELS,
+    RuleVerdict,
+    criteria_label,
+)
 
 # 기준표 group.mode 허용값
 GROUP_MODES: tuple[str, ...] = ("cumulative_length", "area_ratio")
+
+# 기본 기준표 id = config.CRITERIA_PATH의 파일명(stem). 사이드바 selectbox의 초기 선택값.
+DEFAULT_CRITERIA_ID: str = Path(config.CRITERIA_PATH).stem
+
+
+def _read_criteria_json(path: Path) -> dict:
+    """기준표 JSON 파일 → dict. 파싱 실패/최상위 비객체는 ValueError (RuleEngine과 같은 정책)."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"기준표 JSON 파싱 실패: {path} — {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError(f"기준표 형식 오류: 최상위가 객체(dict)가 아닙니다 — {path}")
+    return data
+
+
+def _criteria_entry(path: Path, meta: dict) -> dict:
+    """meta 블록 → 목록 항목 {id, path, name, version, edition_note}."""
+    return {
+        "id": path.stem,
+        "path": path,
+        "name": str(meta.get("name") or path.stem),
+        "version": str(meta.get("version") or ""),
+        "edition_note": str(meta.get("edition_note") or ""),
+    }
+
+
+def list_criteria(criteria_dir: str | Path = config.CRITERIA_DIR) -> list[dict]:
+    """기준표(규격 판본별 JSON) 목록 — criteria 디렉터리의 모든 *.json.
+
+    반환: [{id, path, name, version, edition_note}, ...]
+      - id = 파일명(stem) — RuleEngine(id)로 그대로 로드 가능
+      - 기본 기준표(config.CRITERIA_PATH)가 맨 앞, 나머지는 파일명 순 (결정론적)
+    JSON 파싱 실패 또는 meta 블록 누락은 ValueError로 거부한다 — 잘못된 기준표 파일을
+    조용히 건너뛰면 판독원이 그 존재를 알 수 없기 때문이다(fail-loud).
+    """
+    default_path = Path(config.CRITERIA_PATH).resolve()
+    paths = sorted(
+        Path(criteria_dir).glob("*.json"),
+        key=lambda p: (p.resolve() != default_path, p.name),
+    )
+    entries: list[dict] = []
+    for path in paths:
+        data = _read_criteria_json(path)
+        meta = data.get("meta")
+        if not isinstance(meta, dict):
+            raise ValueError(f"기준표 형식 오류: 'meta' 블록이 없거나 객체(dict)가 아닙니다 — {path}")
+        entries.append(_criteria_entry(path, meta))
+    return entries
+
+
+def _looks_like_criteria_id(s: str) -> bool:
+    """경로 구분자·.json 확장자가 없는 문자열은 기준표 id(파일명 stem)로 본다."""
+    return bool(s) and "/" not in s and "\\" not in s and not s.lower().endswith(".json")
+
+
+def resolve_criteria_path(criteria: str | Path | None = None) -> Path:
+    """기준표 id 또는 경로 → 실제 JSON 경로.
+
+    - None → 기본 기준표(config.CRITERIA_PATH)
+    - Path 또는 존재하는 경로 문자열 → 그대로
+    - 그 외 문자열 → criteria 디렉터리의 '<id>.json'; 없으면 FileNotFoundError(사용 가능 id 안내)
+    """
+    if criteria is None:
+        return Path(config.CRITERIA_PATH)
+    if isinstance(criteria, Path):
+        return criteria
+    text = str(criteria)
+    direct = Path(text)
+    if direct.exists():
+        return direct
+    if _looks_like_criteria_id(text):
+        candidate = Path(config.CRITERIA_DIR) / f"{text}.json"
+        if candidate.is_file():
+            return candidate
+        available = ", ".join(p.stem for p in sorted(Path(config.CRITERIA_DIR).glob("*.json")))
+        raise FileNotFoundError(
+            f"기준표 id '{text}'에 해당하는 JSON이 없습니다 ({config.CRITERIA_DIR}). "
+            f"사용 가능한 id: {available or '(없음)'}"
+        )
+    return direct  # 존재하지 않는 경로 — 이후 read_text에서 FileNotFoundError
 
 
 def _fmt_mm(x: float) -> str:
@@ -99,19 +199,15 @@ class RuleEngine:
     """데이터 주도 결정론적 룰 엔진.
 
     기준표 JSON(criteria)만 교체하면 실제 규격으로 전환 가능 — 코드 무변경.
+    규격 판본(2023/2021 · 2014/2016 …)도 criteria/ 디렉터리의 JSON 하나가 판본 하나이며,
+    생성자에 id(파일명 stem) 또는 경로를 넘기는 것만으로 전환된다(list_criteria() 참조).
     LLM/탐지기는 이 클래스의 입력에도 출력에도 관여하지 않는다.
     """
 
     def __init__(self, criteria_path: str | Path = config.CRITERIA_PATH):
-        path = Path(criteria_path)
-        try:
-            raw = path.read_text(encoding="utf-8")
-            data = json.loads(raw)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"기준표 JSON 파싱 실패: {path} — {e}") from e
-
-        if not isinstance(data, dict):
-            raise ValueError(f"기준표 형식 오류: 최상위가 객체(dict)가 아닙니다 — {path}")
+        # 기준표 id("demo_iso5817_2014_like") 또는 파일 경로 — 규격 판본 전환은 이 인자만 바뀐다
+        path = resolve_criteria_path(criteria_path)
+        data = _read_criteria_json(path)
         for key in ("meta", "rules", "default_rule"):
             if key not in data:
                 raise ValueError(f"기준표 형식 오류: 필수 블록 '{key}' 누락 — {path}")
@@ -135,6 +231,7 @@ class RuleEngine:
 
         self._data: dict = data
         self._quality_levels: tuple[str, ...] = quality_levels
+        self._path: Path = path
 
     @staticmethod
     def _validate_rules(rules: dict, quality_levels: tuple[str, ...], path: Path) -> None:
@@ -228,8 +325,33 @@ class RuleEngine:
 
     @property
     def meta(self) -> dict:
-        """기준표 meta 블록 (이름/버전/디스클레이머)."""
+        """기준표 meta 블록 (이름/버전/판본 메모/디스클레이머)."""
         return self._data["meta"]
+
+    @property
+    def criteria_path(self) -> Path:
+        """로드된 기준표 JSON 경로."""
+        return self._path
+
+    @property
+    def criteria_id(self) -> str:
+        """기준표 id = 파일명(stem) — list_criteria()의 id, 사이드바 selectbox 값과 동일."""
+        return self._path.stem
+
+    @property
+    def criteria_name(self) -> str:
+        """meta.name (없으면 id) — 판정 기록·PDF에 남기는 기준표 이름."""
+        return str(self.meta.get("name") or self.criteria_id)
+
+    @property
+    def criteria_version(self) -> str:
+        """meta.version (없으면 '') — 판정 기록·PDF에 남기는 기준표 버전."""
+        return str(self.meta.get("version") or "")
+
+    @property
+    def criteria_label(self) -> str:
+        """표시용 '이름 (v버전)'."""
+        return criteria_label(self.criteria_name, self.criteria_version)
 
     def evaluate(
         self,

@@ -93,6 +93,7 @@ HISTORY_SYSTEM_PROMPT = (
 
 # build_payload ↔ template_report 가 공유하는 페이로드 섹션 마커
 _SEC_OVERVIEW = "검사 개요"
+_SEC_CONDITIONS = "촬영 조건"  # IACS UR W33 §8.2·8.5 선급 보고 항목 — 입력된 것만, 비어 있으면 섹션 생략
 _SEC_DEFECTS = "결함별 판정"
 _SEC_OVERALL = "종합 판정"
 
@@ -125,8 +126,10 @@ def build_payload(
     """비식별 판정 요약 텍스트 생성 (한국어).
 
     포함: 업무 식별자(film_id/weld_id/block), 이음 종류, 모재 두께, 품질 등급,
+          선급 보고 항목(IACS UR W33 §8.2·8.5 — 입력된 것만, '[촬영 조건]' 섹션),
           결함별(유형/크기mm/허용한계mm/합부/근거 조항), 전체 합부.
     제외: 검사원 실명(inspector), 이미지 데이터, 파일 경로.
+          검사자 '자격 등급'(personnel_qualification)은 개인식별 정보가 아니므로 포함한다.
           LLM 전송의 유일한 통로인 이 함수에서 비식별 원칙을 강제한다.
     """
     measured = {m.defect_id: m for m in measurements}
@@ -140,6 +143,15 @@ def build_payload(
     lines.append(f"모재 두께: {context.thickness_mm:g} mm")
     lines.append(f"품질 등급: {context.quality_level or '-'}")
     lines.append(f"검사 기법: {context.technique or '-'}")
+
+    # 선급 보고 항목 — 입력된 것만. 하나도 없으면 섹션 자체를 생략한다(캐시 키·템플릿 안정).
+    report = getattr(context, "report", None)
+    filled = report.filled_items() if report is not None else []
+    if filled:
+        lines.append("")
+        lines.append(f"[{_SEC_CONDITIONS}]")
+        for item, value in filled:
+            lines.append(f"{item.label_ko}: {value}")
 
     lines.append("")
     lines.append(f"[{_SEC_DEFECTS}]")
@@ -464,6 +476,7 @@ def template_report(payload: str) -> str:
     """
     sections = _split_sections(payload)
     overview = sections.get(_SEC_OVERVIEW, [])
+    conditions = sections.get(_SEC_CONDITIONS, [])
     defects = sections.get(_SEC_DEFECTS, [])
     overall = sections.get(_SEC_OVERALL, [])
     has_defects = bool(defects) and not any(NO_DEFECT_PHRASE in line for line in defects)
@@ -480,6 +493,10 @@ def template_report(payload: str) -> str:
         # 섹션 마커가 없는 임의 페이로드도 소견서 형태로 감싼다 (절대 실패 금지)
         lines.append("  - 아래 판정 요약 원문 참조.")
         lines.extend(f"    {line.strip()}" for line in payload.splitlines() if line.strip())
+    if conditions:
+        # 선급 보고 항목(IACS UR W33 §8) — payload에 있을 때만 개요 아래에 옮겨 적는다
+        lines.append("  촬영 조건 (IACS UR W33 §8 보고 항목):")
+        lines.extend(f"    - {line}" for line in conditions)
     lines.append("")
 
     lines.append("2. 결함 소견")
