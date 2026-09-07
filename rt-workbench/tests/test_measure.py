@@ -75,3 +75,38 @@ def test_measure_without_scale():
     length_px, length_mm = measure((0, 0), (0, 10), None)
     assert length_px == pytest.approx(10.0)
     assert length_mm is None
+
+
+# ---------------------------------------------------------------- 용접선 축 위치 (100 mm 창 이동 판정 입력)
+
+
+def test_weld_axis_position_is_midpoint_times_scale_default_x():
+    from rtworkbench.measure import weld_axis_position_mm
+
+    # 측정선 (100,10)-(140,30): 중점 x=120 → 0.5 mm/px → 60 mm ; y 축이면 중점 y=20 → 10 mm
+    assert weld_axis_position_mm((100.0, 10.0), (140.0, 30.0), 0.5) == 60.0
+    assert weld_axis_position_mm((100.0, 10.0), (140.0, 30.0), 0.5, axis="x") == 60.0
+    assert weld_axis_position_mm((100.0, 10.0), (140.0, 30.0), 0.5, axis="y") == 10.0
+    assert weld_axis_position_mm((100.0, 10.0), (140.0, 30.0), None) is None  # 스케일 미확정
+
+
+def test_weld_axis_invalid_axis_raises():
+    from rtworkbench.measure import positions_from_measurements, weld_axis_position_mm
+
+    with pytest.raises(ValueError):
+        weld_axis_position_mm((0.0, 0.0), (1.0, 1.0), 0.1, axis="z")
+    with pytest.raises(ValueError):
+        positions_from_measurements([], 0.1, axis="diag")
+
+
+def test_positions_from_measurements_maps_defect_ids_and_supports_axis_y():
+    from rtworkbench.measure import positions_from_measurements
+    from rtworkbench.models import Measurement
+
+    ms = [
+        Measurement(defect_id="a", p1=(0.0, 100.0), p2=(20.0, 100.0), length_px=20.0, length_mm=2.0),
+        Measurement(defect_id="b", p1=(300.0, 40.0), p2=(340.0, 60.0), length_px=44.7, length_mm=4.47),
+    ]
+    assert positions_from_measurements(ms, 0.1) == {"a": 1.0, "b": 32.0}  # x 중점 10·320 px
+    assert positions_from_measurements(ms, 0.1, axis="y") == {"a": 10.0, "b": 5.0}  # y 중점 100·50 px
+    assert positions_from_measurements(ms, None) == {}  # 스케일 미확정 → 룰 엔진 폴백

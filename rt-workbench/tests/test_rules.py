@@ -637,3 +637,127 @@ def test_list_criteria_임의_디렉터리_파일명순_및_깨진_JSON은_Value
     (tmp_path / "broken.json").write_text('{"rules": {}}', encoding="utf-8")  # meta 누락
     with pytest.raises(ValueError):
         list_criteria(tmp_path)
+
+
+# ═══════════════ 100 mm 창 이동(최악 구간) 그룹 판정 — IACS UR W33 Rev.2 판독 구간 지침 ═══════════════
+
+from rtworkbench.rules import NO_POSITION_NOTE, worst_window  # noqa: E402
+
+
+def test_최악구간_기공_군집3건은_창에_들고_먼_2건은_빠진다(engine):
+    # d=2.4 기공 5건: 10/30/50 mm 군집 + 200/400 mm 원거리. 100 mm 창은 군집 3건만 담는다.
+    # 손 계산: 3 × π × 1.2² = 13.57 mm² ÷ (100 × 20) × 100 = 0.68 % ≤ 1.0 % → 합격
+    items = [("a", "porosity", 2.4, 10.0), ("b", "porosity", 2.4, 30.0), ("c", "porosity", 2.4, 50.0),
+             ("d", "porosity", 2.4, 200.0), ("e", "porosity", 2.4, 400.0)]
+    verdicts = engine.evaluate_all(items, thickness_mm=12.0, quality_level="B")
+    g = _group(verdicts, "porosity")
+    assert g.window_mm == (10.0, 110.0) and (g.window_start_mm, g.window_end_mm) == (10.0, 110.0)
+    assert g.size_mm == 0.68 and g.limit_mm == 1.0 and g.passed is True and g.unit == "%"
+    assert "최악 100mm 구간 [10.0~110.0 mm] 내 기공 3건(필름 전체 5건 중) 원 근사 면적 합 13.57mm²" in g.detail
+    assert "= 0.68% ≤ 한계 1.0% → 합격" in g.detail
+    assert NO_POSITION_NOTE not in g.detail
+    # 전체 5건을 한 구간으로 합산했다면 22.62 mm² → 1.13 % 불합격이었을 값 — 창 이동이 실제로 값을 바꾼다
+    whole = engine.evaluate_group("porosity", [2.4] * 5, 12.0, "B")
+    assert whole.size_mm == 1.13 and whole.passed is False and whole.window_mm is None
+
+
+def test_최악구간은_값이_가장_큰_창이다_누적길이(engine):
+    # 슬래그 B t12: 한계 min(0.5×12, 12.5) = 6.0. 위치 0/50/100/150 에 2.0 씩 → 어느 100 mm 창이든 3건(6.0)
+    # 이지만, 150 mm 결함만 3.5 라면 [50~150] 창(2.0+2.0+3.5 = 7.5)이 최악 → 불합격
+    items = [("s1", "slag_inclusion", 2.0, 0.0), ("s2", "slag_inclusion", 2.0, 50.0),
+             ("s3", "slag_inclusion", 2.0, 100.0), ("s4", "slag_inclusion", 3.5, 150.0)]
+    g = _group(engine.evaluate_all(items, 12.0, "B"), "slag_inclusion")
+    assert g.window_mm == (50.0, 150.0)
+    assert g.size_mm == 7.5 and g.limit_mm == 6.0 and g.passed is False
+    assert "최악 100mm 구간 [50.0~150.0 mm] 내 슬래그 개재물 3건(필름 전체 4건 중) 길이 합 (2.0 + 2.0 + 3.5) = 7.5mm" in g.detail
+    assert "누적 7.5mm > 한계 → 불합격" in g.detail
+    # 단일 판정은 위치와 무관 — 창 필드는 비어 있다
+    assert all(v.window_mm is None for v in engine.evaluate_all(items, 12.0, "B") if not v.is_group)
+
+
+def test_평가길이가_바뀌면_창_길이도_바뀐다(engine):
+    items = [("a", "porosity", 2.0, 0.0), ("b", "porosity", 2.0, 60.0), ("c", "porosity", 2.0, 120.0)]
+    g50 = _group(engine.evaluate_all(items, 12.0, "B", eval_length_mm=50.0), "porosity")
+    g200 = _group(engine.evaluate_all(items, 12.0, "B", eval_length_mm=200.0), "porosity")
+    assert g50.window_mm == (0.0, 50.0) and "기공 1건(필름 전체 3건 중)" in g50.detail
+    assert g200.window_mm == (0.0, 200.0) and "기공 3건 원 근사" in g200.detail  # 전부 창 안 → '(전체 n건 중)' 생략
+    assert "최악 50mm 구간" in g50.detail and "최악 200mm 구간" in g200.detail
+
+
+def test_위치가_하나라도_없으면_전체_구간_폴백_및_고지(engine):
+    # 4번째 원소 생략 / None / positions 매핑 누락 — 셋 다 폴백
+    for items in (
+        [("a", "slag_inclusion", 2.0), ("b", "slag_inclusion", 2.0, 300.0)],
+        [("a", "slag_inclusion", 2.0, None), ("b", "slag_inclusion", 2.0, 300.0)],
+    ):
+        g = _group(engine.evaluate_all(items, 12.0, "B"), "slag_inclusion")
+        assert g.window_mm is None and g.size_mm == 4.0
+        assert g.detail.endswith(f"({NO_POSITION_NOTE})"), g.detail
+        assert "최악" not in g.detail
+    g = _group(engine.evaluate_all([("a", "slag_inclusion", 2.0), ("b", "slag_inclusion", 2.0)],
+                                   12.0, "B", positions={"a": 0.0}), "slag_inclusion")
+    assert g.window_mm is None and NO_POSITION_NOTE in g.detail
+    # 위치 없이 호출하던 기존 방식은 값이 그대로다(고지 문구만 덧붙음)
+    assert engine.evaluate_group("porosity", [2.0], 12.0, "B").size_mm == 0.16
+
+
+def test_positions_매핑과_4원소_튜플은_같은_결과_튜플이_우선(engine):
+    items3 = [("a", "porosity", 2.4), ("b", "porosity", 2.4), ("c", "porosity", 2.4)]
+    pos = {"a": 0.0, "b": 20.0, "c": 500.0}
+    by_map = engine.evaluate_all(items3, 12.0, "B", positions=pos)
+    by_tuple = engine.evaluate_all([(i, t, s, pos[i]) for i, t, s in items3], 12.0, "B")
+    assert by_map == by_tuple and _group(by_map, "porosity").window_mm == (0.0, 100.0)
+    # 4번째 원소가 있으면 매핑보다 우선한다
+    override = engine.evaluate_all([("a", "porosity", 2.4, 490.0), ("b", "porosity", 2.4),
+                                    ("c", "porosity", 2.4)], 12.0, "B", positions=pos)
+    assert _group(override, "porosity").window_mm == (490.0, 590.0)  # a·c 가 한 창, b 혼자
+
+
+def test_불허_등급도_최악구간을_기록한다(engine):
+    g = engine.evaluate_group("lack_of_fusion", [1.0, 2.0, 5.0], 12.0, "B",
+                              positions=[0.0, 10.0, 999.0])
+    assert g.passed is False and g.limit_mm is None
+    assert g.window_mm == (999.0, 1099.0) and "최악 100mm 구간 [999.0~1099.0 mm] 내 융합불량 1건(필름 전체 3건 중)" in g.detail
+    assert g.size_mm == 5.0  # 창 안 결함(5.0)만 집계
+
+
+def test_창_verdict_직렬화_왕복과_구버전_기록(engine):
+    g = engine.evaluate_group("porosity", [2.0], 12.0, "B", positions=[42.0])
+    d = g.to_dict()
+    assert d["window_start_mm"] == 42.0 and d["window_end_mm"] == 142.0
+    assert RuleVerdict.from_dict(d) == g
+    legacy = {k: v for k, v in d.items() if not k.startswith("window_")}
+    assert RuleVerdict.from_dict(legacy).window_mm is None
+
+
+@pytest.mark.parametrize("bad", [[0.0], [0.0, None, 1.0, 2.0], [0.0, float("nan"), 1.0]])
+def test_positions_길이_불일치_또는_비유한값은_ValueError_단_None은_폴백(engine, bad):
+    sizes = [1.0, 1.0, 1.0]
+    if len(bad) != len(sizes):
+        with pytest.raises(ValueError):
+            engine.evaluate_group("porosity", sizes, 12.0, "B", positions=bad)
+    elif any(p is None for p in bad):
+        assert engine.evaluate_group("porosity", sizes, 12.0, "B", positions=bad).window_mm is None
+    else:
+        with pytest.raises(ValueError):
+            engine.evaluate_group("porosity", sizes, 12.0, "B", positions=bad)
+
+
+def test_items_원소_길이_오류는_ValueError(engine):
+    with pytest.raises(ValueError):
+        engine.evaluate_all([("a", "porosity")], 12.0, "B")  # type: ignore[list-item]
+
+
+def test_worst_window_후보는_시작형_끝형_모두_검토_동률은_시작좌표_작은_창():
+    # 가중치 1 → 건수 최대 창. [10~110]과 [30~130]이 모두 3건(10/30/50 · 30/50/110?) — 아래는 10/30/50/110
+    x0, x1, members = worst_window([10.0, 30.0, 50.0, 110.0], [1.0, 1.0, 1.0, 1.0], 100.0)
+    assert (x0, x1) == (10.0, 110.0) and members == [0, 1, 2, 3]  # 양끝 포함 → 4건
+    x0, x1, members = worst_window([10.0, 30.0, 50.0, 110.01], [1.0, 1.0, 1.0, 1.0], 100.0)
+    assert (x0, x1) == (10.0, 110.0) and members == [0, 1, 2]  # 110.01 은 창 밖
+    # 입력 순서와 무관 — 정렬 후 판단, 반환 인덱스는 입력 순서
+    x0, x1, members = worst_window([400.0, 50.0, 10.0, 30.0], [1.0, 1.0, 1.0, 1.0], 100.0)
+    assert (x0, x1) == (10.0, 110.0) and members == [1, 2, 3]
+    with pytest.raises(ValueError):
+        worst_window([], [], 100.0)
+    with pytest.raises(ValueError):
+        worst_window([1.0], [1.0, 2.0], 100.0)

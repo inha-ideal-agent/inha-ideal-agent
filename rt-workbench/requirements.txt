@@ -10,4 +10,4 @@ requests>=2.31
 pytest>=8.0
 
 # 선택(무거움): 실데이터 학습 후 YOLO 백엔드 활성화 시에만 설치
-# ultralytics>=8.2
+# ultralytics>=8.4  # YOLO26 가중치 로드에 필요

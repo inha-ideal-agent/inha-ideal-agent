@@ -172,3 +172,130 @@ def test_archive_loads_legacy_row_whose_payload_has_no_report(tmp_path):
     dst = Archive(tmp_path / "dst.db")
     assert dst.import_json(db.export_all_json()) == 1
     assert dst.get("rec-legacy").context.report.is_empty()
+
+
+# ---------------------------------------------------------------- W33 §8 원문 불릿 충족률 (n/25)
+
+from rtworkbench.models import (  # noqa: E402
+    W33_GROUP_COUNTS,
+    W33_ITEM_TOTAL,
+    W33_ITEMS,
+    RuleVerdict,
+    w33_coverage,
+    w33_item_filled,
+)
+
+
+def _full_report() -> ReportDetails:
+    return ReportDetails(
+        hull_number="H-2031", weld_length_mm="300", personnel_qualification="ISO 9712 RT Level 2",
+        steel_grade="AH36", welding_process="FCAW (136)", testing_standard="ISO 17636-1 Class B",
+        equipment="Ir-192 감마선 장비, 단벽 단상", limitations_viewing="제한 없음, 18℃", repairs_count=3,
+        source_type_size="Ir-192, 2.0×2.0 mm", xray_kv="", film_type="AGFA D4, 1매", exposures_count="3",
+        screens="Pb 0.1 mm", exposure_technique="SWSI", exposure_time_s="90", sfd_mm="700",
+        source_to_weld_mm="688", weld_to_film_mm="12", beam_angle_deg="0", iqi_sensitivity="W13 (1.6%)",
+        iqi_type_position="ISO 19232-1 선형, 선원측", density="2.3~2.8", geometric_unsharpness="0.03",
+        rt_acceptance_class="ISO 10675-1 Level 1",
+    )
+
+
+def test_w33_items_are_the_25_bullets_13_general_12_rt():
+    """분모 = W33 §8.2 일반 13 + §8.5 RT 12 = 25 원문 불릿(입력 필드 25개와 다른 단위)."""
+    assert W33_ITEM_TOTAL == 25 and W33_GROUP_COUNTS == {"general": 13, "rt": 12}
+    assert [i.group for i in W33_ITEMS] == ["general"] * 13 + ["rt"] * 12  # 원문 순서
+    assert len({i.key for i in W33_ITEMS}) == 25
+    for item in W33_ITEMS:
+        assert item.label_ko and item.label_en and item.rule_ko
+    # 원문 불릿 대조(§8.5): 촬영 기법+노출 시간+SFD 가 한 불릿, 선원-용접부/용접부-필름 거리는 각각 별도
+    rt_en = [i.label_en for i in W33_ITEMS if i.group == "rt"]
+    assert rt_en[4].startswith("Exposure technique, time of exposure and source-to-film distance")
+    assert rt_en[5] == "Distance from radiation source to weld"
+    assert rt_en[6] == "Distance from source side of the weld to radiographic film"
+    assert rt_en[0].startswith("Type and size of radiation source") and "X-ray voltage" in rt_en[0]
+
+
+def test_w33_coverage_empty_context_counts_only_always_true_items():
+    """빈 컨텍스트: 검사일(승인 시각 자동)·합격 기준(품질등급+기준표 항상 기록)만 충족 → 2/25."""
+    n, total, missing = w33_coverage(InspectionContext())
+    assert (n, total) == (2, 25) and len(missing) == 23
+    assert "검사일" not in missing and "합격 기준" not in missing
+    assert missing[0] == "선체 번호·용접부 위치·검사 길이" and missing[-1] == "RT 합격 등급"  # W33_ITEMS 순서
+    # 판정 전엔 결과/합부 선언 불릿이 미충족
+    assert "검사 결과(합격 기준 대비 지시 위치·크기)" in missing and "합부 선언·평가일·평가자" in missing
+
+
+def test_w33_coverage_full_context_after_judgment_is_25_of_25():
+    ctx = InspectionContext(block="3번 블록", weld_id="W-102", inspector="홍길동", report=_full_report())
+    assert w33_coverage(ctx, judged=False) == (23, 25, ["검사 결과(합격 기준 대비 지시 위치·크기)",
+                                                        "합부 선언·평가일·평가자"])
+    assert w33_coverage(ctx, judged=True) == (25, 25, [])
+    # 승인 기록이 있으면 판정 완료로 간주 (judged 생략)
+    rec = _record(ctx)
+    rec.verdicts = [RuleVerdict("d1", "porosity", 1.0, "B", 12.0, 2.4, True, "DEMO-2011", "ok")]
+    assert w33_coverage(rec.context, rec) == (25, 25, [])
+    assert w33_coverage(ctx, judged=True)[0] == 25 and ctx.report.coverage() == (24, 25)  # 필드 수와는 다른 값
+
+
+@pytest.mark.parametrize(
+    "key, ctx_kwargs, report_kwargs, expected",
+    [
+        # 선체 번호·위치·길이: 셋 모두 있어야 충족
+        ("hull_location_length", {}, {"hull_number": "H"}, False),
+        ("hull_location_length", {"weld_id": "W"}, {"hull_number": "H"}, False),
+        ("hull_location_length", {"weld_id": "W"}, {"hull_number": "H", "weld_length_mm": "300"}, True),
+        ("hull_location_length", {"block": "B3"}, {"hull_number": "H", "weld_length_mm": "300"}, True),
+        ("hull_location_length", {}, {"hull_number": "H", "weld_length_mm": "300"}, False),
+        # 검사자: 성명 + 자격 등급
+        ("personnel", {"inspector": "홍길동"}, {}, False),
+        ("personnel", {}, {"personnel_qualification": "L2"}, False),
+        ("personnel", {"inspector": "홍길동"}, {"personnel_qualification": "L2"}, True),
+        # 강재·이음·두께·용접 방법: 강재 등급 + 용접 방법 (이음·두께는 컨텍스트 필수값)
+        ("material_joint_process", {}, {"steel_grade": "AH36"}, False),
+        ("material_joint_process", {}, {"welding_process": "FCAW"}, False),
+        ("material_joint_process", {}, {"steel_grade": "AH36", "welding_process": "FCAW"}, True),
+        # 검사 규격: 기법명(technique 기본값)만으로는 충족되지 않는다
+        ("testing_standards", {"technique": "RT (필름 스캔)"}, {}, False),
+        ("testing_standards", {}, {"testing_standard": "ISO 17636-1"}, True),
+        # 조건부 항목: 보수 횟수 0 은 미충족
+        ("repairs", {}, {"repairs_count": 0}, False),
+        ("repairs", {}, {"repairs_count": 3}, True),
+        # RT: 선원 종류·크기만 있으면 충족(관전압은 X선 장비에만 해당), 관전압만으론 불충족
+        ("source_voltage", {}, {"xray_kv": "200"}, False),
+        ("source_voltage", {}, {"source_type_size": "Ir-192"}, True),
+        # RT: 촬영 기법+노출 시간+SFD 세 필드가 한 불릿
+        ("exposure_technique_time_sfd", {}, {"sfd_mm": "700"}, False),
+        ("exposure_technique_time_sfd", {}, {"exposure_technique": "SWSI", "exposure_time_s": "90"}, False),
+        ("exposure_technique_time_sfd", {}, {"exposure_technique": "SWSI", "exposure_time_s": "90",
+                                             "sfd_mm": "700"}, True),
+        # RT: IQI 감도 + 종류·위치
+        ("iqi", {}, {"iqi_sensitivity": "W13"}, False),
+        ("iqi", {}, {"iqi_sensitivity": "W13", "iqi_type_position": "선원측"}, True),
+        # 거리 두 불릿은 서로 독립
+        ("source_to_weld", {}, {"weld_to_film_mm": "12"}, False),
+        ("source_to_weld", {}, {"source_to_weld_mm": "688"}, True),
+        ("weld_to_film", {}, {"weld_to_film_mm": "12"}, True),
+    ],
+)
+def test_w33_item_rules(key, ctx_kwargs, report_kwargs, expected):
+    ctx = InspectionContext(**ctx_kwargs, report=ReportDetails(**report_kwargs))
+    assert w33_item_filled(key, ctx) is expected
+
+
+def test_w33_results_and_statement_depend_on_judgment_and_inspector():
+    ctx = InspectionContext(inspector="")
+    assert w33_item_filled("results", ctx) is False and w33_item_filled("results", ctx, judged=True) is True
+    assert w33_item_filled("acceptance_statement", ctx, judged=True) is False  # 평가자 성명 없음
+    ctx.inspector = "홍길동"
+    assert w33_item_filled("acceptance_statement", ctx, judged=True) is True
+    assert w33_item_filled("acceptance_statement", ctx, judged=False) is False
+    with pytest.raises(KeyError):
+        w33_item_filled("no_such_item", ctx)
+
+
+def test_w33_coverage_on_legacy_record_without_report_does_not_fail(tmp_path):
+    """보고 항목이 없는 구버전 기록도 컨텍스트만으로 계산된다(예외 없음)."""
+    legacy = InspectionContext.from_dict({"film_id": "F-old", "block": "5번 블록", "inspector": "홍길동"})
+    rec = _record(legacy, "rec-legacy")
+    n, total, missing = w33_coverage(rec.context, rec)
+    # 검사일·합격 기준·부재 식별(블록)·검사 결과·합부 선언(판정+판독원) = 5
+    assert (n, total) == (5, 25) and "검사 부재 식별" not in missing and "검사 용접부 식별" in missing

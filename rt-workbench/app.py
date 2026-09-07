@@ -38,6 +38,7 @@ from rtworkbench.models import (
     ReportDetails,
     criteria_label,
     new_id,
+    w33_coverage,
 )
 
 # ---------------------------------------------------------------------------
@@ -608,6 +609,40 @@ def verdicts_to_df(verdicts, criteria_label: str = "") -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# 용접선 축 — 필름 이미지에서 용접부가 놓인 방향. 스캔 필름은 용접선을 가로(x)로 두는 관행을 따른다.
+# (세로로 스캔한 필름을 지원하려면 'y'; measure.weld_axis_position_mm 참조)
+WELD_AXIS = "x"
+
+
+def group_window_caption(verdicts, eval_length_mm: float) -> str:
+    """그룹 판정 행이 어느 구간으로 판정됐는지 한 줄 캡션.
+
+    창 이동 판정(IACS UR W33 Rev.2 100 mm 판독 구간): 유형별 '최악 구간 [x0~x1 mm]'.
+    위치 정보가 없어 전체를 한 구간으로 합산한 유형은 따로 표시한다.
+    """
+    windowed: list[str] = []
+    whole: list[str] = []
+    for v in verdicts:
+        if not rules.is_group_verdict(v):
+            continue
+        w = v.window_mm
+        if w is None:
+            whole.append(v.type_ko)
+        else:
+            windowed.append(f"{v.type_ko} [{w[0]:g}~{w[1]:g} mm]")
+    parts: list[str] = []
+    if windowed:
+        parts.append(
+            f"🔎 최악 {eval_length_mm:g}mm 구간(IACS UR W33 100 mm 판독 구간 — 용접선을 따라 창을 "
+            f"이동시켜 가장 불리한 구간으로 판정): " + " · ".join(windowed)
+        )
+    if whole:
+        parts.append(
+            f"⚠️ {rules.NO_POSITION_NOTE}(스케일 미확정): " + " · ".join(whole)
+        )
+    return "  /  ".join(parts)
+
+
 # ---------------------------------------------------------------------------
 # 탭 1 — 판독 워크벤치
 # ---------------------------------------------------------------------------
@@ -904,6 +939,12 @@ def _render_judgment(ctx: InspectionContext) -> None:
                 items.append((c.id, c.defect_type, m.length_mm))
             else:
                 unmeasured.append(f"{c.id}({c.type_ko})")
+        # 용접선 축 위치(mm) — 스케일이 확정됐을 때만: 측정선 중점 × 스케일 (용접선 = 이미지 x축 가정).
+        # 룰 엔진은 이 위치로 평가 길이(기본 100 mm) 창을 이동시켜 최악 구간으로 그룹 판정한다
+        # (IACS UR W33 Rev.2 100 mm 판독 구간). 스케일 미확정이면 {} → 전체를 한 구간으로 보수적 합산.
+        positions = measure.positions_from_measurements(
+            meas.values(), ctx.scale_mm_per_px, axis=WELD_AXIS
+        )
         if unmeasured:
             # fail-safe: 미측정 채택 결함이 있으면 종합 판정을 확정하지 않는다 —
             # 제외하고 진행하면 허용불가 유형(crack 등)조차 룰 엔진에 전달되지 않아
@@ -921,6 +962,7 @@ def _render_judgment(ctx: InspectionContext) -> None:
             verdicts = engine.evaluate_all(
                 items, ctx.thickness_mm, ctx.quality_level,
                 eval_length_mm=ctx.eval_length_mm, weld_width_mm=ctx.weld_width_mm,
+                positions=positions,
             )
         except Exception as exc:
             st.error(f"룰 판정에 실패했습니다: {exc}")
@@ -947,6 +989,7 @@ def _render_judgment(ctx: InspectionContext) -> None:
             )
             if any(rules.is_group_verdict(v) for v in verdicts):
                 st.caption("합계 행 = 누적 길이·투영 면적률(원 근사) 그룹 판정")
+                st.caption(group_window_caption(verdicts, ctx.eval_length_mm))
         else:
             st.caption("판정 대상 결함 없음 (채택+측정된 결함 0건).")
         if overall:
@@ -1319,10 +1362,12 @@ def render_tab_archive() -> None:
             st.success("종합 판정: 합격 ✅")
         else:
             st.error("종합 판정: 불합격 ❌")
-        # 선급 보고 항목(IACS UR W33 §8.2·8.5) — 저장된 것만. 구버전 기록은 0/25.
-        n_filled, n_total = ctx.report.coverage()
-        with st.expander(f"선급 보고 항목(IACS UR W33 §8) — {n_filled}/{n_total} 입력",
+        # 선급 보고 항목(IACS UR W33 §8) — 충족률은 원문 불릿 25개 기준(승인 기록 = 판정 완료).
+        n_filled, n_total, missing = w33_coverage(ctx, rec)
+        with st.expander(f"선급 보고 항목(IACS UR W33 §8) — {n_filled}/{n_total} 충족",
                          expanded=False):
+            if missing:
+                st.caption("미충족: " + ", ".join(missing))
             filled = ctx.report.filled_items()
             if filled:
                 st.table(
@@ -1576,7 +1621,10 @@ def render_tab_info() -> None:
 
     st.divider()
     st.subheader("참고 자료")
-    st.caption("제안서 참고 문헌과 같은 목록입니다 — README.md의 '참고 자료' 절과 동일하게 유지합니다.")
+    st.caption(
+        "제안서 참고 문헌 중 규격·데이터셋·논문·도구 항목(뉴스·보도자료 제외) — "
+        "README.md의 '참고 자료' 절과 동일하게 유지합니다."
+    )
     st.markdown(REFERENCES_MD)
 
     st.divider()
@@ -1589,7 +1637,7 @@ def render_tab_info() -> None:
 
 
 def _render_report_details_inputs() -> None:
-    """선급 보고 항목(IACS UR W33 §8.2·8.5) 입력 — 접힌 expander + 'n/25 입력' 캡션.
+    """선급 보고 항목(IACS UR W33 §8.2·8.5) 입력 — 접힌 expander + 'n/25 충족' 캡션(W33 불릿 기준).
 
     판정에 관여하지 않는 문서 전용 필드이므로 on_change 는 미리 생성한 PDF만 무효화한다
     (invalidate_judgment 를 호출하지 않는다).
@@ -1616,8 +1664,14 @@ def _render_report_details_inputs() -> None:
                         label, key=report_widget_key(item.key), placeholder=item.placeholder,
                         on_change=invalidate_pdf_only, help=f"W33 {section} — {item.label_en}",
                     )
-    n_filled, n_total = build_report_from_sidebar().coverage()
-    st.caption(f"📋 선급 보고 항목 {n_filled}/{n_total} 입력")
+    # 충족률은 W33 원문 불릿(일반 13 + RT 12 = 25) 단위 — 컨텍스트(블록·용접부·판독원)·판정 실행으로
+    # 충족되는 항목도 센다. 입력 필드 25개의 단순 입력 수(ReportDetails.coverage)와는 다르다.
+    judged = st.session_state.get("wb_overall") is not None
+    n_filled, n_total, missing = w33_coverage(build_context_from_sidebar(), judged=judged)
+    st.caption(
+        f"📋 선급 보고 항목(IACS UR W33 §8) {n_filled}/{n_total} 충족 — "
+        + (f"미입력: {', '.join(missing)}" if missing else "모두 충족")
+    )
 
 
 def render_sidebar() -> InspectionContext:

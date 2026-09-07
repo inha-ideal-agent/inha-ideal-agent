@@ -157,6 +157,56 @@ def test_judgment_appends_group_verdict_using_sidebar_eval_window():
     g = verdicts[-1]
     assert g.unit == "%" and "평가길이 50mm × 용접부 폭 10mm" in g.detail
     assert at.session_state["wb_overall"] is True
+    # 스케일 확정 → 측정선 중점 × 스케일 = 용접선 축 위치 → 창 이동(최악 구간) 판정, 캡션에 구간 표시
+    assert g.window_mm == (0.0, 50.0) and "최악 50mm 구간 [0.0~50.0 mm] 내 기공 1건" in g.detail
+    assert any("최악 50mm 구간" in c.value and "기공 [0~50 mm]" in c.value for c in at.caption)
+
+
+def test_judgment_with_measurements_uses_worst_100mm_window_from_measurement_positions():
+    """측정선 중점 × 스케일 → 용접선(x축) 위치 → 100 mm 창 이동: 군집 3건만 담는 최악 구간으로 판정.
+
+    detail 에 '구간' 이 들어가고, 판정 캡션에 선택된 구간이 표시된다. 스케일이 없으면 전체 구간 폴백.
+    """
+    from rtworkbench.models import DefectCandidate, Measurement
+
+    at = _boot_with_image()
+    # 스케일 0.1 mm/px: x 중점 100/300/500 px → 10/30/50 mm 군집, 2000/4000 px → 200/400 mm 원거리
+    xs = {"p1": 100.0, "p2": 300.0, "p3": 500.0, "p4": 2000.0, "p5": 4000.0}
+    at.session_state["wb_candidates"] = [
+        DefectCandidate(id=k, defect_type="porosity", bbox=(x - 12, 10, x + 12, 34),
+                        confidence=1.0, source="human", status="accepted")
+        for k, x in xs.items()
+    ]
+    at.session_state["wb_measurements"] = {
+        k: Measurement(defect_id=k, p1=(x - 12.0, 20.0), p2=(x + 12.0, 20.0), length_px=24.0, length_mm=2.4)
+        for k, x in xs.items()
+    }
+    at.session_state["wb_scale_mm_per_px"] = 0.1
+    at.run(timeout=60)
+    _button(at, "wb_btn_judge").click()
+    at.run(timeout=60)
+    assert not at.exception
+    verdicts = at.session_state["wb_verdicts"]
+    g = verdicts[-1]
+    assert g.defect_id == "GROUP:porosity" and "구간" in g.detail
+    assert g.window_mm == (10.0, 110.0)
+    assert "최악 100mm 구간 [10.0~110.0 mm] 내 기공 3건(필름 전체 5건 중)" in g.detail
+    assert g.size_mm == 0.68 and g.passed is True  # 전체 합산이었다면 1.13% 불합격
+    assert at.session_state["wb_overall"] is True
+    caption = next(c.value for c in at.caption if "최악 100mm 구간" in c.value)
+    assert "기공 [10~110 mm]" in caption and "IACS UR W33 100 mm 판독 구간" in caption
+
+    # 스케일 미확정(주입된 mm 만 있음) → 위치 없음 → 전체를 한 구간으로 보수적 합산 + 안내 캡션
+    at.session_state["wb_scale_mm_per_px"] = None
+    at.session_state["wb_overall"] = None
+    at.run(timeout=60)
+    _button(at, "wb_btn_judge").click()
+    at.run(timeout=60)
+    assert not at.exception
+    g = at.session_state["wb_verdicts"][-1]
+    assert g.window_mm is None and "위치 정보 없음 → 전체를 한 구간으로 보수적 합산" in g.detail
+    assert g.size_mm == 1.13 and g.passed is False
+    assert any("전체를 한 구간으로 보수적 합산" in c.value and "기공" in c.value for c in at.caption)
 
 
 # ─────────────── 선급 보고 항목(IACS UR W33 §8.2·8.5) — 사이드바 expander ───────────────
@@ -169,7 +219,10 @@ def _coverage_caption(at) -> str:
 
 
 def test_report_details_expander_exists_and_coverage_caption_renders():
-    """사이드바 expander(접힘)에 25개 입력 위젯이 있고 '선급 보고 항목 n/25 입력' 캡션이 보인다."""
+    """사이드바 expander(접힘)에 25개 입력 위젯이 있고 W33 불릿 기준 'n/25 충족 — 미입력: …' 캡션이 보인다.
+
+    빈 컨텍스트라도 검사일(승인 시각)·합격 기준(품질등급+기준표)은 항상 충족 → 2/25 에서 시작한다.
+    """
     from rtworkbench.models import REPORT_ITEMS
 
     at = AppTest.from_file(str(APP_PATH))
@@ -177,7 +230,11 @@ def test_report_details_expander_exists_and_coverage_caption_renders():
     assert not at.exception
     exp = next(e for e in at.expander if e.label == REPORT_EXPANDER_LABEL)
     assert exp.proto.expanded is False  # 기본 접힘
-    assert _coverage_caption(at) == "📋 선급 보고 항목 0/25 입력"
+    cap = _coverage_caption(at)
+    assert cap.startswith("📋 선급 보고 항목(IACS UR W33 §8) 2/25 충족 — 미입력: ")
+    missing = cap.split("미입력: ", 1)[1].split(", ")
+    assert len(missing) == 23 and missing[0] == "선체 번호·용접부 위치·검사 길이" and missing[-1] == "RT 합격 등급"
+    assert "검사일" not in missing and "합격 기준" not in missing  # 항상 충족되는 두 불릿은 미입력 목록에 없다
     # 항목마다 위젯 1개 — 보수 횟수만 number_input, 나머지는 text_input (help 에 W33 원문)
     for item in REPORT_ITEMS:
         key = f"wb_rpt_{item.key}"
@@ -190,12 +247,27 @@ def test_report_details_expander_exists_and_coverage_caption_renders():
             assert item.label_en in (w.help or "")
         assert item.label_ko in w.label
 
+    # 선체 번호만으론 '선체 번호·위치·길이' 불릿 미충족, SFD 만으론 '촬영 기법·노출 시간·SFD' 미충족,
+    # 보수 횟수 3 은 충족 → 2 + 1 = 3/25 (입력 필드 수 3 과 우연히 같지만 다른 단위)
     at.text_input(key="wb_rpt_hull_number").set_value("H-2031")
     at.text_input(key="wb_rpt_sfd_mm").set_value("700")
     at.number_input(key="wb_rpt_repairs_count").set_value(3)
     at.run(timeout=60)
     assert not at.exception
-    assert _coverage_caption(at) == "📋 선급 보고 항목 3/25 입력"
+    cap = _coverage_caption(at)
+    assert cap.startswith("📋 선급 보고 항목(IACS UR W33 §8) 3/25 충족 — 미입력: ")
+    assert "보수 횟수" not in cap and "촬영 기법·노출 시간·SFD" in cap
+    # 불릿의 나머지 하위 정보를 채우면 그 불릿이 충족된다: 용접부 ID + 검사 길이 → 선체 번호 불릿(+1),
+    # 촬영 기법 + 노출 시간 → SFD 불릿(+1), 용접부 ID → 용접부 식별 불릿(+1) = 6/25
+    at.text_input(key="wb_ctx_weld_id").set_value("BL3-V-012")
+    at.text_input(key="wb_rpt_weld_length_mm").set_value("300")
+    at.text_input(key="wb_rpt_exposure_technique").set_value("SWSI")
+    at.text_input(key="wb_rpt_exposure_time_s").set_value("90")
+    at.run(timeout=60)
+    assert not at.exception
+    cap = _coverage_caption(at)
+    assert cap.startswith("📋 선급 보고 항목(IACS UR W33 §8) 6/25 충족 — 미입력: ")
+    assert "선체 번호" not in cap and "SFD" not in cap and "검사 용접부 식별" not in cap
 
 
 def test_report_details_do_not_invalidate_judgment_but_flow_into_record(monkeypatch, tmp_path):
@@ -235,7 +307,10 @@ def test_report_details_do_not_invalidate_judgment_but_flow_into_record(monkeypa
     assert at.session_state["wb_overall"] is True  # 판정 유지
     assert [v.to_dict() for v in at.session_state["wb_verdicts"]] == verdicts_before
     assert at.session_state["wb_pdf_bytes"] is None  # 낡은 PDF만 버린다
-    assert _coverage_caption(at) == "📋 선급 보고 항목 2/25 입력"
+    # W33 불릿 기준: 검사일·합격 기준(항상) + 검사 결과(판정 완료) = 3 — 선체 번호만·관전압만으론 불릿 미충족
+    cap = _coverage_caption(at)
+    assert cap.startswith("📋 선급 보고 항목(IACS UR W33 §8) 3/25 충족 — 미입력: ")
+    assert "검사 결과" not in cap and "합부 선언·평가일·평가자" in cap  # 판독원 성명이 없어 합부 선언은 미충족
 
     _button(at, "wb_btn_approve").click()
     at.run(timeout=60)
@@ -243,12 +318,15 @@ def test_report_details_do_not_invalidate_judgment_but_flow_into_record(monkeypa
     rec = Archive(tmp_path / "t.db").get(at.session_state["wb_record_id"])
     assert rec is not None
     assert rec.context.report.hull_number == "H-2031" and rec.context.report.xray_kv == "200"
-    assert rec.context.report.coverage() == (2, 25)
+    assert rec.context.report.coverage() == (2, 25)  # 입력 필드 수(구 지표)는 그대로 쓸 수 있다
+    from rtworkbench.models import w33_coverage
+    assert w33_coverage(rec.context, rec)[:2] == (3, 25)
     pdf = at.session_state["wb_pdf_bytes"]
     assert pdf and pdf.startswith(b"%PDF")
     pymupdf = pytest.importorskip("pymupdf")
     text = "".join(pg.get_text() for pg in pymupdf.open(stream=pdf, filetype="pdf"))
     assert "5. 선급 보고 항목" in text and "H-2031" in text and "200 kV" in text
+    assert "보고 항목 충족 3/25" in text  # PDF 5절 헤더도 W33 불릿 기준
 
 
 # ─────────────── 기준표(규격 판본) 선택 — 사이드바 selectbox ───────────────

@@ -30,6 +30,7 @@ from rtworkbench.models import (
     Measurement,
     ReportDetails,
     new_id,
+    w33_coverage,
 )
 from rtworkbench.preprocess import apply_clahe, load_grayscale
 from rtworkbench.report_llm import ReportWriter, build_payload
@@ -105,27 +106,42 @@ def main() -> None:
         scale_ref=f"납마커 {mk['length_mm']:g}mm",
         # 선급 보고 항목(IACS UR W33 §8.2·8.5) — 문서 전용, 판정에 관여하지 않는다
         report=ReportDetails(
-            hull_number="H-2031", personnel_qualification="ISO 9712 RT Level 2",
+            hull_number="H-2031", weld_length_mm="300", personnel_qualification="ISO 9712 RT Level 2",
             steel_grade="AH36", welding_process="FCAW (136)",
             source_type_size="Ir-192, 2.0×2.0 mm", sfd_mm="700",
             iqi_sensitivity="W13 (1.6%)", iqi_type_position="ISO 19232-1 선형, 선원측",
             density="2.3~2.8", rt_acceptance_class="ISO 10675-1 Level 1",
         ),
     )
-    n_filled, n_total = context.report.coverage()
-    step(f"6-0. 선급 보고 항목 입력 {n_filled}/{n_total} (IACS UR W33 §8.2·8.5)")
+    n_fields, n_fields_total = context.report.coverage()
+    n_w33, n_w33_total, missing = w33_coverage(context, judged=False)
+    step(
+        f"6-0. 선급 보고 항목 입력 필드 {n_fields}/{n_fields_total} · "
+        f"IACS UR W33 §8 불릿 충족 {n_w33}/{n_w33_total} (판정 전; 미충족 {len(missing)}개)"
+    )
     # 기준표(규격 판본)는 JSON 파일 단위 — 기본은 config.CRITERIA_PATH(2023/2021 구조 데모).
     # 2028.01 이전 건조계약분이면 RuleEngine("demo_iso5817_2014_like") 처럼 id만 바꾸면 된다.
     engine = RuleEngine()
     assert engine.criteria_id in {e["id"] for e in list_criteria()}, "기준표 목록에 기본 기준표가 없음"
     items = [(c.id, c.defect_type, m.length_mm) for c, m in zip(accepted, measurements)]
-    verdicts = engine.evaluate_all(items, context.thickness_mm, context.quality_level)
+    # 용접선 축 위치(측정선 중점 × 스케일, 용접선 = 이미지 x축) → 100 mm 창 이동(최악 구간) 그룹 판정
+    positions = measure.positions_from_measurements(measurements, mm_per_px, axis="x")
+    assert set(positions) == {c.id for c in accepted}, "스케일 확정 후에는 모든 측정에 위치가 있어야 함"
+    verdicts = engine.evaluate_all(
+        items, context.thickness_mm, context.quality_level,
+        eval_length_mm=context.eval_length_mm, weld_width_mm=context.weld_width_mm,
+        positions=positions,
+    )
     ok = overall_pass(verdicts)
     step(
         f"6. 룰 판정 완료 (기준표: {engine.criteria_label}): {len(verdicts)}건, "
         f"종합 {'합격' if ok else '불합격'} "
         f"({sum(v.passed for v in verdicts)}건 합격 / {sum(not v.passed for v in verdicts)}건 불합격)"
     )
+    for g in (v for v in verdicts if v.is_group):
+        assert g.window_mm is not None and "구간" in g.detail, "그룹 판정이 창 이동 방식이 아님"
+        step(f"6-1. {g.display_id}: 최악 {context.eval_length_mm:g}mm 구간 "
+             f"[{g.window_mm[0]:g}~{g.window_mm[1]:g} mm] → {'합격' if g.passed else '불합격'}")
 
     # ---------------------------------------------------------- 7. 페이로드 + 소견서(템플릿)
     payload = build_payload(context, verdicts, measurements)
@@ -167,6 +183,9 @@ def main() -> None:
     archive.save(record)
     loaded = archive.get(record_id)
     assert loaded is not None and loaded.record_id == record_id, "저장 기록 재조회 실패"
+    n_w33, n_w33_total, missing = w33_coverage(loaded.context, loaded)
+    step(f"9-1. 승인 기록 기준 IACS UR W33 §8 보고 항목 충족 {n_w33}/{n_w33_total}"
+         + (f" (미충족: {', '.join(missing)})" if missing else ""))
     assert loaded.criteria_name == engine.criteria_name, "아카이브 기록에 적용 기준표 이름이 없음"
     assert loaded.context.report == context.report, "아카이브 기록에 선급 보고 항목이 보존되지 않음"
     step(f"9. 아카이브 저장 완료: {config.DB_PATH} (record_id={record_id})")

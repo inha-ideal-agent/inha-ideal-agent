@@ -113,11 +113,23 @@ class RuleVerdict:
     clause: str  # 근거 조항 표기 (데모 기준표의 항목 ID)
     detail: str  # 판정 근거 설명 (한국어, 룰 엔진이 결정론적으로 생성)
     unit: str = "mm"  # size_mm/limit_mm의 단위: 'mm' | '%'(투영 면적률 그룹 판정)
+    # 그룹 판정에서 선택된 '최악 평가 구간' [start, end] (mm, 용접선 축 좌표 — IACS UR W33 100 mm 판독 구간).
+    # 위치 정보로 창 이동 판정을 했을 때만 채워진다. None = 단일 판정, 또는 위치 정보가 없어
+    # 전체를 한 구간으로 합산한 그룹 판정(폴백). 구버전 기록에는 없으므로 기본값 None.
+    window_start_mm: float | None = None
+    window_end_mm: float | None = None
 
     @property
     def is_group(self) -> bool:
         """그룹 판정(유형별 누적 길이·투영 면적률) 행 여부."""
         return self.defect_id.startswith(GROUP_ID_PREFIX)
+
+    @property
+    def window_mm(self) -> tuple[float, float] | None:
+        """창 이동 그룹 판정이 고른 최악 구간 (start, end) mm — 없으면 None."""
+        if self.window_start_mm is None or self.window_end_mm is None:
+            return None
+        return (self.window_start_mm, self.window_end_mm)
 
     @property
     def type_ko(self) -> str:
@@ -133,7 +145,8 @@ class RuleVerdict:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "RuleVerdict":
-        return cls(**d)  # 구버전 기록에 unit이 없으면 기본값 'mm'
+        # 구버전 기록: unit이 없으면 'mm', window_*가 없으면 None(전체 구간 판정)
+        return cls(**d)
 
 
 @dataclass(frozen=True)
@@ -315,6 +328,167 @@ class ReportDetails:
             else:
                 kwargs[k] = "" if v is None else str(v)
         return cls(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# IACS UR W33 §8.2·§8.5 보고 항목 충족률 — 원문 불릿 25개(일반 13 + RT 12) 단위
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class W33Item:
+    """IACS UR W33 §8.2/§8.5 원문 불릿 1개 — 충족률 'n/25'의 분모 단위.
+
+    ReportDetails 필드(25개 입력 필드)와는 다르다: W33 불릿 하나가 여러 입력 필드를 묶기도 하고
+    (촬영 기법+노출 시간+SFD), 검사 컨텍스트/판정 기록만으로 충족되는 불릿도 있다(검사일, 합격 기준…).
+    """
+
+    key: str
+    label_ko: str  # 한국어 라벨 (UI 캡션 '미입력: …' · PDF)
+    label_en: str  # W33 원문 불릿
+    group: str  # 'general'(§8.2) | 'rt'(§8.5)
+    rule_ko: str  # 충족 규칙(사람이 읽는 설명 — README·도움말과 동일)
+
+
+# 충족 규칙 원칙: 불릿의 하위 정보 중 워크벤치가 담을 수 있는 것이 **모두** 있을 때 충족.
+# 검사 컨텍스트/판정/승인 기록에 이미 있는 정보는 자동 충족(중복 입력 없음). 조건부 항목(보수 횟수)은
+# 기본값 0(해당 없음)과 미입력을 구분할 수 없어 1 이상일 때만 충족(보수적 — 과대 계상 금지).
+W33_ITEMS: tuple[W33Item, ...] = (
+    # ---- §8.2 일반 항목 13개
+    W33Item("date_of_testing", "검사일", "Date of testing", "general",
+            "승인 시각(created_at)이 자동 기록 → 항상 충족"),
+    W33Item("hull_location_length", "선체 번호·용접부 위치·검사 길이",
+            "Hull number, location and length of weld inspected", "general",
+            "선체 번호 + 위치(블록 또는 용접부 ID) + 검사 용접 길이 모두"),
+    W33Item("personnel", "검사자 성명·자격 등급(·서명)",
+            "Names, qualification level and signature of personnel that have performed the testing",
+            "general", "판독원(성명) + 검사자 자격 등급 모두 — 서명은 출력물에 수기"),
+    W33Item("component_id", "검사 부재 식별", "Identification of the component examined", "general",
+            "블록"),
+    W33Item("weld_id", "검사 용접부 식별", "Identification of the welds examined", "general",
+            "용접부 ID"),
+    W33Item("material_joint_process", "강재 등급·이음 종류·모재 두께·용접 방법",
+            "Steel grade, type of joint, thickness of parent material, welding process", "general",
+            "강재 등급 + 용접 방법 모두 (이음 종류·모재 두께는 컨텍스트 필수값 → 자동)"),
+    W33Item("acceptance_criteria", "합격 기준", "Acceptance criteria", "general",
+            "품질등급 + 적용 기준표(JSON 이름·버전) 항상 기록 → 항상 충족"),
+    W33Item("testing_standards", "적용 검사 규격", "Testing standards used", "general",
+            "검사 규격 — 기법명('RT (필름 스캔)')은 규격이 아니므로 제외"),
+    W33Item("equipment", "검사 장비·배치", "Testing equipment and arrangement used", "general",
+            "검사 장비·배치"),
+    W33Item("limitations_viewing", "제한사항·관찰 조건·온도",
+            "Any test limitations, viewing conditions and temperature", "general",
+            "제한사항·관찰 조건·온도"),
+    W33Item("results", "검사 결과(합격 기준 대비 지시 위치·크기)",
+            "Results of testing with reference to acceptance criteria, location and size of "
+            "reportable indications", "general",
+            "판정 실행 후(verdict 표 — 결함 없음도 결과) 충족"),
+    W33Item("acceptance_statement", "합부 선언·평가일·평가자",
+            "Statement of acceptance / non-acceptance, evaluation date, name and signature of "
+            "evaluator", "general",
+            "판정 실행 + 판독원(성명) 모두 — 평가일은 승인 시각 자동"),
+    W33Item("repairs", "보수 횟수(2회 초과 보수 시)",
+            "Number of repairs if specific area repaired more than twice", "general",
+            "보수 횟수 1 이상 — 조건부 항목, 0(해당 없음)은 기본값과 구분 불가라 미충족 처리"),
+    # ---- §8.5 RT 전용 항목 12개
+    W33Item("source_voltage", "선원 종류·크기(·X선 관전압)",
+            "Type and size of radiation source (width of radiation source), X-ray voltage", "rt",
+            "선원 종류·크기 — X선 관전압은 X선 장비일 때만 해당(감마선은 해당 없음)이라 필수 아님"),
+    W33Item("film", "필름 종류·카세트당 매수",
+            "Type of film/designation and number of film in each film holder/cassette", "rt",
+            "필름 종류·카세트당 매수"),
+    W33Item("exposures", "촬영 매수", "Number of radiographs (exposures)", "rt", "촬영 매수"),
+    W33Item("screens", "증감지 종류", "Type of intensifying screens", "rt", "증감지 종류"),
+    W33Item("exposure_technique_time_sfd", "촬영 기법·노출 시간·SFD",
+            "Exposure technique, time of exposure and source-to-film distance", "rt",
+            "촬영 기법 + 노출 시간 + 선원-필름 거리(SFD) 모두"),
+    W33Item("source_to_weld", "선원-용접부 거리", "Distance from radiation source to weld", "rt",
+            "선원-용접부 거리"),
+    W33Item("weld_to_film", "용접부-필름 거리",
+            "Distance from source side of the weld to radiographic film", "rt", "용접부-필름 거리"),
+    W33Item("beam_angle", "빔 입사각(법선 기준)",
+            "Angle of radiation beam through the weld (from normal)", "rt", "빔 입사각"),
+    W33Item("iqi", "IQI 감도·종류·위치",
+            "Sensitivity, type and position of IQI (source side or film side)", "rt",
+            "IQI 감도 + IQI 종류·위치 모두"),
+    W33Item("density", "농도", "Density", "rt", "농도"),
+    W33Item("geometric_unsharpness", "기하학적 불선명도", "Geometric un-sharpness", "rt",
+            "기하학적 불선명도"),
+    W33Item("rt_acceptance_class", "RT 합격 등급", "Specific acceptance class criteria for RT", "rt",
+            "RT 합격 등급"),
+)
+
+W33_ITEM_TOTAL: int = len(W33_ITEMS)  # 25 = §8.2 일반 13 + §8.5 RT 12 — UI 'n/25 충족'의 분모
+W33_GROUP_COUNTS: dict[str, int] = {
+    g: sum(1 for i in W33_ITEMS if i.group == g) for g in ("general", "rt")
+}  # {'general': 13, 'rt': 12}
+
+
+def _txt(value: Any) -> bool:
+    return bool(str(value or "").strip())
+
+
+def w33_item_filled(key: str, context: "InspectionContext", *, judged: bool = False) -> bool:
+    """W33 불릿 1개의 충족 여부 — W33_ITEMS[*].rule_ko 와 1:1로 대응하는 결정론적 규칙.
+
+    judged: 판정 실행 여부(verdict 표 존재). 승인 기록(InspectionRecord)이 있으면 항상 True.
+    """
+    r = context.report
+    f = ReportDetails._is_filled
+    location = _txt(context.block) or _txt(context.weld_id)
+    rules: dict[str, Any] = {
+        "date_of_testing": lambda: True,
+        "hull_location_length": lambda: f(r.hull_number) and location and f(r.weld_length_mm),
+        "personnel": lambda: _txt(context.inspector) and f(r.personnel_qualification),
+        "component_id": lambda: _txt(context.block),
+        "weld_id": lambda: _txt(context.weld_id),
+        "material_joint_process": lambda: f(r.steel_grade) and f(r.welding_process),
+        "acceptance_criteria": lambda: True,
+        "testing_standards": lambda: f(r.testing_standard),
+        "equipment": lambda: f(r.equipment),
+        "limitations_viewing": lambda: f(r.limitations_viewing),
+        "results": lambda: bool(judged),
+        "acceptance_statement": lambda: bool(judged) and _txt(context.inspector),
+        "repairs": lambda: f(r.repairs_count),
+        "source_voltage": lambda: f(r.source_type_size),
+        "film": lambda: f(r.film_type),
+        "exposures": lambda: f(r.exposures_count),
+        "screens": lambda: f(r.screens),
+        "exposure_technique_time_sfd": lambda: (
+            f(r.exposure_technique) and f(r.exposure_time_s) and f(r.sfd_mm)
+        ),
+        "source_to_weld": lambda: f(r.source_to_weld_mm),
+        "weld_to_film": lambda: f(r.weld_to_film_mm),
+        "beam_angle": lambda: f(r.beam_angle_deg),
+        "iqi": lambda: f(r.iqi_sensitivity) and f(r.iqi_type_position),
+        "density": lambda: f(r.density),
+        "geometric_unsharpness": lambda: f(r.geometric_unsharpness),
+        "rt_acceptance_class": lambda: f(r.rt_acceptance_class),
+    }
+    try:
+        return bool(rules[key]())
+    except KeyError:
+        raise KeyError(f"알 수 없는 W33 항목 키: {key!r}") from None
+
+
+def w33_coverage(
+    context: "InspectionContext",
+    record: "InspectionRecord | None" = None,
+    *,
+    judged: bool | None = None,
+) -> tuple[int, int, list[str]]:
+    """IACS UR W33 §8.2·8.5 보고 항목 충족률 → (충족 수, 25, 미충족 라벨 목록[W33_ITEMS 순서]).
+
+    - record 가 주어지면 승인 기록 기준(판정 완료로 간주, context 는 record.context 를 써도 됨).
+    - record 없이 작업 중인 검사(사이드바)라면 judged 로 판정 실행 여부를 넘긴다(기본 False).
+    - 분모는 항상 25(원문 불릿 수). 구버전 기록도 컨텍스트만으로 계산되어 예외가 없다.
+    """
+    if judged is None:
+        judged = record is not None
+    missing = [
+        item.label_ko for item in W33_ITEMS if not w33_item_filled(item.key, context, judged=judged)
+    ]
+    return W33_ITEM_TOTAL - len(missing), W33_ITEM_TOTAL, missing
 
 
 @dataclass

@@ -503,15 +503,23 @@ def test_build_pdf_report_section_present_only_when_filled(record):
     assert pdf.startswith(b"%PDF")
     text = _pdf_text(pdf)
     assert "5. 선급 보고 항목(IACS UR W33 §8)" in text
-    assert "입력 항목 10/25" in text
+    # 충족률은 W33 불릿 기준(승인 기록 = 판정 완료): 검사일·합격 기준·검사 결과(항상/판정) + 블록·용접부 ID
+    # (컨텍스트) + 검사자(판독원+자격) + 합부 선언(판정+판독원) + 보수 3회 + 선원·농도·RT 등급 = 11/25.
+    # 선체 번호(길이 없음)·SFD(기법·시간 없음)·IQI 감도(종류·위치 없음)·강재(용접 방법 없음)는 불릿 미충족
+    # → 입력 필드 수 10/25(ReportDetails.coverage) 와 다른 값이다.
+    assert record.context.report.coverage() == (10, 25)
+    assert "보고 항목 충족 11/25" in text and "입력 항목 10/25" not in text
+    assert "일반 13" in text and "RT 12" in text and "미충족:" in text
     assert "일반 항목 (§8.2)" in text and "RT 촬영 조건 (§8.5)" in text
     assert "H-2031" in text and "Hull number" in text  # 한국어 라벨 + W33 원문 병기
     assert "ISO 9712 RT Level 2" in text and "3회" in text
     assert "200 kV" in text and "700 mm" in text and "2.3~2.8" in text
-    assert "용접 방법" not in text and "Welding process" not in text  # 미입력 항목 생략
+    # 미입력 항목은 표에서 생략(W33 원문 라벨 'Welding process' 없음) — 한국어 '용접 방법'은 헤더의
+    # 미충족 목록('강재 등급·이음 종류·모재 두께·용접 방법')에만 한 번 나온다
+    assert "Welding process" not in text and text.count("용접 방법") == 1
     for section in ("1. 검사 정보", "2. 결함 판정", "3. 종합 판정", "4. 소견서 본문", "적용 기준표"):
         assert section in text
     # 가운뎃점(U+00B7)은 내장 CID 폰트에 글리프가 없어 사라지므로 아래아(U+318D)로 렌더링된다
     assert "선원 종류ㆍ크기" in text and "선원 종류크기" not in text
-    assert "입력 항목 10/25 ㆍ 판정에" in text  # 캡션의 가운뎃점도 동일 처리
+    assert "일반 13 ㆍ" in text  # 캡션의 가운뎃점도 동일 처리
     assert "표시ㆍ문서화" in text  # 기존 푸터('후보 표시·문서화')도 더 이상 글자가 빠지지 않는다

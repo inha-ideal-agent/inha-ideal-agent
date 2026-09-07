@@ -23,7 +23,13 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
-from rtworkbench.models import DEFECT_TYPES, REPORT_GROUPS, InspectionRecord
+from rtworkbench.models import (
+    DEFECT_TYPES,
+    REPORT_GROUPS,
+    W33_GROUP_COUNTS,
+    InspectionRecord,
+    w33_coverage,
+)
 
 # reportlab 내장 한글 CID 폰트 — 폰트 파일 배포 불필요
 _FONT = "HYSMyeongJo-Medium"
@@ -200,16 +206,28 @@ def build_pdf(record: InspectionRecord) -> bytes:
             verdict_style.append(("TEXTCOLOR", (0, i), (-1, i), _FAIL))
     verdict_table.setStyle(TableStyle(verdict_style))
     story.append(verdict_table)
-    if any(v.is_group for v in record.verdicts):
-        story.append(
-            Paragraph(
-                _glyph_safe(
-                    "합계 행 = 유형별 그룹 판정: 누적 길이(평가 길이 내 길이 합) · "
-                    "투영 면적률(원 근사 면적 합 ÷ 평가 길이 × 용접부 폭, %)."
-                ),
-                st["footer"],
-            )
+    group_verdicts = [v for v in record.verdicts if v.is_group]
+    if group_verdicts:
+        # 100 mm 판독 구간 규칙(IACS UR W33 Rev.2) — 어느 구간으로 판정했는지 기록에 남긴다
+        windows = [
+            f"{DEFECT_TYPES.get(v.defect_type, v.defect_type)} [{v.window_mm[0]:g}~{v.window_mm[1]:g} mm]"
+            for v in group_verdicts if v.window_mm is not None
+        ]
+        whole = [
+            DEFECT_TYPES.get(v.defect_type, v.defect_type)
+            for v in group_verdicts if v.window_mm is None
+        ]
+        note = (
+            "합계 행 = 유형별 그룹 판정: 누적 길이(평가 길이 내 길이 합) · "
+            "투영 면적률(원 근사 면적 합 ÷ 평가 길이 × 용접부 폭, %). "
+            f"평가 길이 {ctx.eval_length_mm:g} mm 창을 용접선을 따라 이동시켜 가장 불리한 구간으로 판정"
+            "(IACS UR W33 Rev.2 100 mm 판독 구간 규칙)."
         )
+        if windows:
+            note += " 최악 구간: " + ", ".join(windows) + "."
+        if whole:
+            note += " 위치 정보 없음 → 전체를 한 구간으로 보수적 합산: " + ", ".join(whole) + "."
+        story.append(Paragraph(_glyph_safe(note), st["footer"]))
     story.append(Spacer(1, 5 * mm))
 
     # ------------------------------------------------------------ 종합 판정 (크게)
@@ -247,16 +265,16 @@ def build_pdf(record: InspectionRecord) -> bytes:
     filled = ctx.report.filled_items()
     if filled:
         story.append(Paragraph("5. 선급 보고 항목(IACS UR W33 §8)", st["h2"]))
-        n_filled, n_total = ctx.report.coverage()
-        story.append(
-            Paragraph(
-                _xml(
-                    f"입력 항목 {n_filled}/{n_total} · 판정에 관여하지 않는 보고서 기재 사항 "
-                    "(§8.2 일반 항목 중 검사 정보 표에 없는 것 + §8.5 RT 전용 항목)."
-                ),
-                st["footer"],
-            )
+        # 충족률은 W33 원문 불릿 25개(일반 13 · RT 12) 기준 — 검사 정보 표·판정 표로 충족되는 항목 포함
+        n_filled, n_total, missing = w33_coverage(ctx, record)
+        header = (
+            f"보고 항목 충족 {n_filled}/{n_total} "
+            f"(IACS UR W33 §8.2 일반 {W33_GROUP_COUNTS['general']} · §8.5 RT {W33_GROUP_COUNTS['rt']}"
+            + (f"; 미충족: {', '.join(missing)}" if missing else "; 모두 충족")
+            + ") · 아래 표는 판정에 관여하지 않는 보고서 기재 사항 "
+            "(§8.2 일반 항목 중 검사 정보 표에 없는 것 + §8.5 RT 전용 항목, 입력된 것만)."
         )
+        story.append(Paragraph(_xml(header), st["footer"]))
         story.append(Spacer(1, 1.5 * mm))
         report_rows: list[list] = [
             [Paragraph("항목", st["cell_center"]), Paragraph("값", st["cell_center"])]

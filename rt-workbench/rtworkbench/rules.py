@@ -36,25 +36,38 @@ class RuleEngine:
         - detail은 한국어로 근거를 서술 (예: "두께 12.0mm × 계수 0.2 = 2.4mm ≤ cap 3.0mm
           → 허용 한계 2.4mm, 측정값 3.1mm 초과 → 불합격").'''
 
-    def evaluate_all(self, items: list[tuple[str, str, float]],
+    def evaluate_all(self, items: list[tuple[str, str, float] | tuple[str, str, float, float | None]],
                      thickness_mm: float, quality_level: str, *,
                      eval_length_mm: float = 100.0,
-                     weld_width_mm: float = 20.0) -> list[RuleVerdict]:
-        '''items = [(defect_id, defect_type, size_mm), ...] 일괄 판정.
+                     weld_width_mm: float = 20.0,
+                     positions: Mapping[str, float] | None = None) -> list[RuleVerdict]:
+        '''items = [(defect_id, defect_type, size_mm[, pos_mm]), ...] 일괄 판정.
         단일 verdict(입력 순서 보존) 뒤에, 기준표에 "group" 블록이 있는 유형마다
         그룹 verdict 1건(defect_id="GROUP:<type>", 유형 최초 등장 순)을 덧붙인다.
+        pos_mm(4번째 원소) 또는 positions={defect_id: pos_mm} 로 용접선 축 위치를 주면
+        그룹 판정이 창 이동(최악 구간) 방식으로 수행된다 — evaluate_group 참조.
         eval_length_mm/weld_width_mm <= 0 → ValueError.'''
 
     def evaluate_group(self, defect_type: str, sizes: list[float],
                        thickness_mm: float, quality_level: str, *,
                        eval_length_mm: float = 100.0,
-                       weld_width_mm: float = 20.0) -> RuleVerdict | None:
+                       weld_width_mm: float = 20.0,
+                       positions: Sequence[float | None] | None = None) -> RuleVerdict | None:
         '''유형별 그룹 판정 1건. 기준표에 group 블록이 없는 유형(또는 sizes 비어 있음)이면 None.
         - mode="cumulative_length": 합계 = Σ size_mm (평가 길이 내 누적 길이) [mm],
           limit = min(coef_thickness×t, cap_mm) — 단일 규칙과 같은 형태. unit="mm"
         - mode="area_ratio": 면적률 = Σ π·(d/2)² ÷ (eval_length_mm × weld_width_mm) × 100 [%]
           (d = 측정 최대 치수, 원 근사), limit = limit_pct. size_mm/limit_mm에 % 값 저장, unit="%"
-        - permitted=false → limit_mm=None, passed=False'''
+        - permitted=false → limit_mm=None, passed=False
+        - positions(sizes 와 같은 길이, 결함 중심의 용접선 축 위치 mm)가 모두 있으면
+          **창 이동 판정**: 길이 eval_length_mm 의 창을 용접선 축을 따라 이동시켜(각 결함 위치에서
+          시작하는 창 + 끝나는 창을 후보로) 창 안 결함(중심 기준, 양끝 포함)의 누적 길이/면적률이
+          가장 큰 **최악 구간** 하나로 판정한다 — IACS UR W33 Rev.2 지침("100 mm 판독 구간을
+          필름 전체에 걸쳐 적용, 기공은 가장 심한 분포의 100 mm 구간"). verdict.window_start_mm/
+          window_end_mm 에 구간을 기록하고 detail 에 "최악 100mm 구간 [x0~x1 mm] 내 …"로 명시.
+        - positions 가 None 이거나 하나라도 None 이면 **폴백**: 유형 전체를 한 구간으로 합산(보수적)하고
+          detail 에 "위치 정보 없음 → 전체를 한 구간으로 보수적 합산"을 덧붙인다. window_*=None.
+        - len(positions) != len(sizes) 또는 유한하지 않은 위치 → ValueError'''
 
 def overall_pass(verdicts: list[RuleVerdict]) -> bool:
     '''전체 합부: 모든 verdict(그룹 verdict 포함)가 passed일 때만 True. 빈 목록은 True(결함 없음).'''
@@ -86,6 +99,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+from typing import Mapping, Sequence
 
 from rtworkbench import config
 from rtworkbench.models import (
@@ -193,6 +207,47 @@ def _check_eval_window(eval_length_mm: float, weld_width_mm: float) -> None:
         raise ValueError(f"평가 길이(eval_length_mm)는 0보다 커야 합니다: {eval_length_mm}")
     if weld_width_mm <= 0:
         raise ValueError(f"용접부 폭(weld_width_mm)은 0보다 커야 합니다: {weld_width_mm}")
+
+
+# 폴백(위치 정보 없음) 그룹 판정의 detail 에 덧붙이는 고지 — UI/PDF/테스트가 같은 문구를 본다
+NO_POSITION_NOTE = "위치 정보 없음 → 전체를 한 구간으로 보수적 합산"
+
+_EPS = 1e-9
+
+
+def worst_window(
+    positions: Sequence[float], weights: Sequence[float], length_mm: float
+) -> tuple[float, float, list[int]]:
+    """길이 length_mm 의 창을 용접선 축을 따라 이동시켜 가중치 합이 최대인 **최악 구간**을 고른다.
+
+    IACS UR W33 Rev.2 지침의 구현: "100 mm 판독 구간을 필름 전체에 걸쳐(연속된 여러 100 mm 구간으로)
+    적용하고, 기공은 가장 심한 분포를 담은 100 mm 구간을 택한다."
+
+    - 후보 창 = 각 결함 위치 p 에서 시작하는 창 [p, p+L] + 각 위치에서 끝나는 창 [p−L, p].
+      어떤 창이든 왼쪽 끝을 창 안 첫 결함 위치까지 밀어도 구성원을 잃지 않으므로, 이 후보만으로
+      최악 창을 반드시 찾는다(누적 길이·건수·면적 모두 결함별 가중치의 합이라 동일).
+    - 창 안 여부 = 결함 **중심** 위치가 [x0, x1] 안(양끝 포함, 1e-9 허용 오차). 창 안 결함은 크기 전체를 센다.
+    - 동률이면 먼저 나온 후보(위치 오름차순의 시작형 창)를 택해 결정론적이다.
+
+    반환: (x0, x1, 창 안 결함 인덱스 목록 — 입력 순서). positions/weights 길이가 다르거나 비어 있으면 ValueError.
+    """
+    if len(positions) != len(weights):
+        raise ValueError("positions 와 weights 의 길이가 다릅니다")
+    if not positions:
+        raise ValueError("창 이동 판정 대상 결함이 없습니다")
+    if length_mm <= 0:
+        raise ValueError(f"평가 길이(eval_length_mm)는 0보다 커야 합니다: {length_mm}")
+    order = sorted(range(len(positions)), key=lambda i: positions[i])
+    candidates = [(positions[i], positions[i] + length_mm) for i in order]
+    candidates += [(positions[i] - length_mm, positions[i]) for i in order]
+    best_total = -math.inf
+    best: tuple[float, float, list[int]] = (candidates[0][0], candidates[0][1], [])
+    for x0, x1 in candidates:
+        members = [i for i, p in enumerate(positions) if x0 - _EPS <= p <= x1 + _EPS]
+        total = sum(weights[i] for i in members)
+        if total > best_total + _EPS:  # 엄격히 클 때만 교체 → 동률은 먼저 나온 후보 유지
+            best_total, best = total, (x0, x1, members)
+    return best
 
 
 class RuleEngine:
@@ -458,15 +513,24 @@ class RuleEngine:
         *,
         eval_length_mm: float = 100.0,
         weld_width_mm: float = 20.0,
+        positions: Sequence[float | None] | None = None,
     ) -> RuleVerdict | None:
         """유형별 그룹 판정 (결정론적). group 블록이 없는 유형이면 None.
 
         - cumulative_length: 평가 길이 내 같은 유형의 측정 길이 합 vs min(coef×t, cap) [mm]
         - area_ratio: Σπ(d/2)² ÷ (평가 길이 × 용접부 폭) × 100 vs limit_pct [%]
           (size_mm/limit_mm에 % 값을 저장하고 unit="%"로 단위를 명시)
+        - positions(결함 중심의 용접선 축 위치 mm, sizes 와 같은 길이)가 모두 있으면 평가 길이 창을
+          용접선 축을 따라 이동시켜 **최악 구간**(worst_window)만으로 판정한다 — IACS UR W33 Rev.2
+          100 mm 판독 구간 지침. 위치가 하나라도 없으면 전체를 한 구간으로 보수적 합산(폴백)하고
+          detail 에 NO_POSITION_NOTE 를 덧붙인다.
         """
         self._check_inputs(thickness_mm, quality_level, sizes)
         _check_eval_window(eval_length_mm, weld_width_mm)
+        if positions is not None and len(positions) != len(sizes):
+            raise ValueError(
+                f"positions 길이({len(positions)})가 sizes 길이({len(sizes)})와 다릅니다"
+            )
         if not sizes:
             return None
         rule = self._data["rules"].get(defect_type)
@@ -478,14 +542,39 @@ class RuleEngine:
         gname = group.get("name_ko", f"{defect_type} {mode}")
         type_ko = DEFECT_TYPES.get(defect_type, defect_type)
         level = group["levels"][quality_level]
-        sizes_r = [round(s, 2) for s in sizes]  # 정책 2)/4): 단일 판정과 같은 자릿수로 정렬
-        n = len(sizes_r)
+        sizes_all = [round(s, 2) for s in sizes]  # 정책 2)/4): 단일 판정과 같은 자릿수로 정렬
+        n_all = len(sizes_all)
+
+        # ── 창 이동(최악 구간) vs 전체 구간 폴백 ──
+        windowed = positions is not None and all(p is not None for p in positions)
+        if windowed:
+            pos = [float(p) for p in positions]  # type: ignore[union-attr]
+            if not all(math.isfinite(p) for p in pos):
+                raise ValueError(f"위치(positions)는 유한한 수여야 합니다: {positions}")
+            weights = (
+                [math.pi * (d / 2.0) ** 2 for d in sizes_all] if mode == "area_ratio" else sizes_all
+            )
+            x0, x1, members = worst_window(pos, weights, eval_length_mm)
+            sizes_r = [sizes_all[i] for i in members]
+            n = len(sizes_r)
+            count_txt = f"{type_ko} {n}건" + (f"(필름 전체 {n_all}건 중)" if n != n_all else "")
+            scope = f"최악 {eval_length_mm:g}mm 구간 [{_fmt_mm(x0)}~{_fmt_mm(x1)} mm] 내 {count_txt}"
+            window = dict(window_start_mm=round(x0, 2), window_end_mm=round(x1, 2))
+            note = ""
+        else:
+            sizes_r = sizes_all
+            n = n_all
+            scope = f"{type_ko} {n}건"
+            window = dict(window_start_mm=None, window_end_mm=None)
+            note = f" ({NO_POSITION_NOTE})"
+
         common = dict(
             defect_id=f"{GROUP_ID_PREFIX}{defect_type}",
             defect_type=defect_type,
             quality_level=quality_level,
             thickness_mm=thickness_mm,
             clause=group["clause"],
+            **window,
         )
 
         if mode == "area_ratio":
@@ -493,20 +582,22 @@ class RuleEngine:
             ratio = area_sum / (eval_length_mm * weld_width_mm) * 100.0
             value = round(ratio, 2)
             basis = (
-                f"{type_ko} {n}건 원 근사 면적 합 {_fmt_mm(area_sum)}mm² ÷ "
+                f"{scope} 원 근사 면적 합 {_fmt_mm(area_sum)}mm² ÷ "
                 f"(평가길이 {eval_length_mm:g}mm × 용접부 폭 {weld_width_mm:g}mm) "
                 f"= {_fmt_mm(value)}%"
             )
             if not level.get("permitted", True):
                 return RuleVerdict(
                     **common, size_mm=value, limit_mm=None, passed=False, unit="%",
-                    detail=f"품질등급 {quality_level}에서 {gname}은(는) 허용되지 않음 ({basis}) → 불합격",
+                    detail=(
+                        f"품질등급 {quality_level}에서 {gname}은(는) 허용되지 않음 ({basis}) → 불합격{note}"
+                    ),
                 )
             limit = round(float(level["limit_pct"]), 2)  # 정책 1) 한계 먼저 확정
             passed = value <= limit
             detail = (
                 f"품질등급 {quality_level} · {gname}: {basis} "
-                f"{'≤' if passed else '>'} 한계 {_fmt_mm(limit)}% → {'합격' if passed else '불합격'}"
+                f"{'≤' if passed else '>'} 한계 {_fmt_mm(limit)}% → {'합격' if passed else '불합격'}{note}"
             )
             return RuleVerdict(
                 **common, size_mm=value, limit_mm=limit, passed=passed, unit="%", detail=detail
@@ -515,11 +606,11 @@ class RuleEngine:
         # ── cumulative_length: 평가 길이 내 누적 길이 vs min(coef×t, cap) ──
         total = round(sum(sizes_r), 2)
         terms = " + ".join(_fmt_mm(s) for s in sizes_r)
-        basis = f"{type_ko} {n}건 길이 합 ({terms}) = {_fmt_mm(total)}mm"
+        basis = f"{scope} 길이 합 ({terms}) = {_fmt_mm(total)}mm"
         if not level.get("permitted", True):
             return RuleVerdict(
                 **common, size_mm=total, limit_mm=None, passed=False, unit="mm",
-                detail=f"품질등급 {quality_level}에서 {gname}은(는) 허용되지 않음 ({basis}) → 불합격",
+                detail=f"품질등급 {quality_level}에서 {gname}은(는) 허용되지 않음 ({basis}) → 불합격{note}",
             )
         coef = level["coef_thickness"]
         cap = level["cap_mm"]
@@ -530,7 +621,7 @@ class RuleEngine:
             f"품질등급 {quality_level} · {gname}: {basis}; "
             f"두께 {_fmt_mm(thickness_mm)}mm × 계수 {coef} = {_fmt_mm(by_thickness)}mm, "
             f"cap {_fmt_mm(cap)}mm → 허용 한계 {_fmt_mm(limit)}mm (평가길이 {eval_length_mm:g}mm 기준); "
-            f"누적 {_fmt_mm(total)}mm {'≤' if passed else '>'} 한계 → {'합격' if passed else '불합격'}"
+            f"누적 {_fmt_mm(total)}mm {'≤' if passed else '>'} 한계 → {'합격' if passed else '불합격'}{note}"
         )
         return RuleVerdict(
             **common, size_mm=total, limit_mm=limit, passed=passed, unit="mm", detail=detail
@@ -538,30 +629,53 @@ class RuleEngine:
 
     def evaluate_all(
         self,
-        items: list[tuple[str, str, float]],
+        items: Sequence[tuple[str, str, float] | tuple[str, str, float, float | None]],
         thickness_mm: float,
         quality_level: str,
         *,
         eval_length_mm: float = 100.0,
         weld_width_mm: float = 20.0,
+        positions: Mapping[str, float] | None = None,
     ) -> list[RuleVerdict]:
-        """items = [(defect_id, defect_type, size_mm), ...] 일괄 판정 (입력 순서 보존).
+        """items = [(defect_id, defect_type, size_mm[, pos_mm]), ...] 일괄 판정 (입력 순서 보존).
 
         단일 verdict 뒤에, group 블록이 있는 유형마다 그룹 verdict 1건을
         유형의 최초 등장 순서로 덧붙인다. 3인자 호출은 기본 평가 구간(100mm × 20mm)을 쓴다.
+
+        용접선 축 위치(mm): 항목의 4번째 원소 pos_mm, 없거나 None 이면 positions[defect_id].
+        (앱은 measure.positions_from_measurements(측정, 스케일) 로 만든다 — 측정선 중점 × 스케일,
+        용접선이 이미지 x축을 따른다고 가정.) 같은 유형의 위치가 모두 있으면 그룹 판정이
+        창 이동(최악 구간) 방식, 하나라도 없으면 전체 구간 폴백 — evaluate_group 참조.
         """
         _check_eval_window(eval_length_mm, weld_width_mm)
+        parsed: list[tuple[str, str, float, float | None]] = []
+        for item in items:
+            if len(item) == 3:
+                defect_id, defect_type, size_mm = item  # type: ignore[misc]
+                pos: float | None = None
+            elif len(item) == 4:
+                defect_id, defect_type, size_mm, pos = item  # type: ignore[misc]
+            else:
+                raise ValueError(
+                    f"items 원소는 (defect_id, defect_type, size_mm[, pos_mm]) 이어야 합니다: {item!r}"
+                )
+            if pos is None and positions is not None:
+                pos = positions.get(defect_id)
+            parsed.append((defect_id, defect_type, size_mm, None if pos is None else float(pos)))
+
         verdicts = [
             self.evaluate(defect_id, defect_type, size_mm, thickness_mm, quality_level)
-            for defect_id, defect_type, size_mm in items
+            for defect_id, defect_type, size_mm, _pos in parsed
         ]
-        sizes_by_type: dict[str, list[float]] = {}
-        for _defect_id, defect_type, size_mm in items:
-            sizes_by_type.setdefault(defect_type, []).append(size_mm)
-        for defect_type, sizes in sizes_by_type.items():
+        by_type: dict[str, tuple[list[float], list[float | None]]] = {}
+        for _defect_id, defect_type, size_mm, pos in parsed:
+            sizes, poss = by_type.setdefault(defect_type, ([], []))
+            sizes.append(size_mm)
+            poss.append(pos)
+        for defect_type, (sizes, poss) in by_type.items():
             gv = self.evaluate_group(
                 defect_type, sizes, thickness_mm, quality_level,
-                eval_length_mm=eval_length_mm, weld_width_mm=weld_width_mm,
+                eval_length_mm=eval_length_mm, weld_width_mm=weld_width_mm, positions=poss,
             )
             if gv is not None:
                 verdicts.append(gv)

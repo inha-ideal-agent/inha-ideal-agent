@@ -21,7 +21,7 @@
 | # | 기능 | 구현 |
 |---|---|---|
 | 1 | **2차 눈 (Second Reader)** — 판독원이 먼저 보고, AI가 놓침 방지 후보 표시. recall 우선(오탐은 클릭 한 번, 미탐은 배에 남는다) | `rtworkbench/detection.py` — YOLO 백엔드(가중치 있을 때) + OpenCV 폴백 탐지기(항상 동작) |
-| 2 | **2클릭 자 + 룰 판정** — 판독원이 IQI/납마커 기준 2클릭으로 스케일 확정, 결함 크기도 2클릭 확정 → 룰 엔진이 기준표 대조 합부+조항 제시. 판정식 3종: **단일 치수** `min(계수×t, cap)` / **누적 길이** (평가 길이 내 같은 유형의 길이 합) / **투영 면적률** (Σ원 근사 면적 ÷ (평가 길이 × 용접부 폭), %) — 뒤의 둘은 유형별 `합계(...)` 행으로 추가되며, 사이드바의 **평가 길이·용접부 폭** 입력이 기준 구간 | `rtworkbench/measure.py` + `rtworkbench/rules.py` + `criteria/*.json` (규격 판본별 데모 기준표 2종 — 사이드바 **기준표(규격 판본)**에서 선택) |
+| 2 | **2클릭 자 + 룰 판정** — 판독원이 IQI/납마커 기준 2클릭으로 스케일 확정, 결함 크기도 2클릭 확정 → 룰 엔진이 기준표 대조 합부+조항 제시. 판정식 3종: **단일 치수** `min(계수×t, cap)` / **누적 길이** (평가 길이 내 같은 유형의 길이 합) / **투영 면적률** (Σ원 근사 면적 ÷ (평가 길이 × 용접부 폭), %) — 뒤의 둘은 유형별 `합계(...)` 행으로 추가되며, 사이드바의 **평가 길이·용접부 폭** 입력이 기준 구간. 스케일이 확정되면 평가 길이(기본 **100 mm**) 창을 용접선을 따라 이동시켜 **가장 불리한 구간**으로 판정(IACS UR W33 Rev.2 100 mm 판독 구간 지침 — 아래 절 참조) | `rtworkbench/measure.py` + `rtworkbench/rules.py` + `criteria/*.json` (규격 판본별 데모 기준표 2종 — 사이드바 **기준표(규격 판본)**에서 선택) |
 | 3 | **소견서 초안 자동 생성** — 확정된 판정 결과(비식별 텍스트만)를 LLM이 리포트 문체로 작성 → 판독원 수정·승인 → PDF | `rtworkbench/report_llm.py` (로컬 LLM→[명시 허용 시 Claude→Gemini]→오프라인 템플릿 폴백 + 응답 캐시) + `rtworkbench/report_pdf.py` |
 | 4 | **검색 아카이브 + 자기개선 루프** — 승인 기록 DB 축적, "3번 블록 기공 이력" 3초 검색, 승인 기록 = YOLO 라벨 데이터 export | `rtworkbench/db.py` (SQLite) |
 
@@ -120,6 +120,7 @@ app.py (Streamlit UI — 탭: 판독 워크벤치 / 아카이브 검색 / 자기
  ├─ detection.py    2차 눈: YoloDetector(옵션) / CVFallbackDetector(기본)
  ├─ measure.py      2클릭 자: 캘리브레이션(mm/px)·거리 측정   ← 사람이 확정
  ├─ rules.py        결정론적 룰 엔진 ← criteria/*.json (단일 치수·누적 길이·투영 면적률, 데이터 주도)
+ │                    그룹 판정은 100 mm 창 이동(최악 구간) — worst_window(); 위치 없으면 전체 구간 폴백
  │                    규격 판본별 기준표 JSON 분리 — 파일 하나가 판본 하나, 엔진은 JSON 교체만으로 대응:
  │                    ├ demo_iso5817_like.json       ISO 5817:2023/ISO 10675-1:2021 구조 모사
  │                    │                                (IACS UR W33 Rev.2 — 2028.01.01 이후 건조계약분, 기본)
@@ -159,6 +160,25 @@ ISO 5817:2023/ISO 10675-1:2021, 그 이전은 ISO 5817:2014/ISO 10675-1:2016). �
   (`rules.list_criteria()`가 자동 인식, `RuleEngine("<파일명 stem>")`으로 로드). 두 파일의 `meta.edition_note`가
   판본을, `meta.disclaimer`가 데모 여부를 명시합니다.
 
+## 100 mm 판독 구간 — 창 이동(최악 구간) 그룹 판정
+
+IACS UR W33 Rev.2 지침: *"판독 구간 100 mm 를 필름 전체에 걸쳐 적용한다(연속된 여러 100 mm 구간) …
+기공은 가장 심한 분포를 담은 100 mm 구간을 택한다."* 워크벤치의 그룹 판정(누적 길이·투영 면적률)은
+이 지침을 다음과 같이 구현합니다(`rules.worst_window`, `RuleEngine.evaluate_group(..., positions=)`).
+
+1. **위치**: 결함 중심의 용접선 축 위치(mm) = 2클릭 측정선(`Measurement.p1/p2`)의 중점 픽셀 좌표 × 스케일.
+   용접선은 이미지 **x축**을 따라 놓였다고 가정합니다(`measure.weld_axis_position_mm(..., axis='x'|'y')`,
+   앱은 `app.WELD_AXIS = 'x'`). 스케일이 확정된 뒤에만 위치가 생깁니다.
+2. **창 이동**: 사이드바 평가 길이(기본 100 mm) 창을 용접선 축을 따라 이동시킵니다 — 각 결함 위치에서
+   시작하는 창과 끝나는 창을 후보로 삼으면 최악 창을 반드시 찾습니다(어떤 창이든 왼쪽 끝을 첫 결함까지
+   밀어도 구성원을 잃지 않으므로). 창 안 여부는 결함 **중심** 기준(양끝 포함)이며 창 안 결함은 크기 전체를 셉니다.
+3. **최악 구간 선택**: 같은 유형의 창 안 결함으로 누적 길이 또는 투영 면적률을 계산해 **값이 가장 큰 창**
+   하나로 판정합니다(동률이면 시작 좌표가 작은 창 — 결정론적). 판정 근거에
+   `최악 100mm 구간 [x0~x1 mm] 내 기공 3건(필름 전체 5건 중) …` 로 구간을 명시하고
+   `RuleVerdict.window_start_mm/window_end_mm` 에 기록합니다(판정 표 캡션·PDF 각주에도 표시).
+4. **폴백**: 유형 내 결함 하나라도 위치가 없으면(스케일 미확정 등) 종전처럼 필름 전체를 한 구간으로
+   합산하고 근거에 `위치 정보 없음 → 전체를 한 구간으로 보수적 합산` 을 덧붙입니다(과소 판정 방지).
+
 ## 선급 보고 항목 (IACS UR W33 §8.2·8.5) — 보고서 기재 사항 저장
 
 IACS UR W33 §8은 선급에 제출하는 NDT 보고서에 **일반 항목(§8.2, 13개)** 과 **RT 전용 항목(§8.5, 12개)** 을
@@ -166,7 +186,9 @@ IACS UR W33 §8은 선급에 제출하는 NDT 보고서에 **일반 항목(§8.2
 §8.2 항목 중 이미 검사 컨텍스트/기록에 있는 것(검사일 = 승인 일시, 용접부 위치 = 블록/용접부 ID,
 이음 종류, 모재 두께, 합격 기준 = 품질등급 + 적용 기준표, 결과 = 판정 표, 합부 = 종합 판정,
 평가자 = 판독원)은 중복 입력받지 않고, 나머지를 사이드바 **선급 보고 항목(IACS UR W33 §8.2·8.5)**
-expander(기본 접힘)에서 입력합니다. 사이드바 캡션 **"📋 선급 보고 항목 n/25 입력"** 이 입력 커버리지를 보여줍니다.
+expander(기본 접힘)에서 입력합니다. 사이드바 캡션 **"📋 선급 보고 항목(IACS UR W33 §8) n/25 충족 — 미입력: …"**
+이 **보고 항목 25개(일반 13·RT 12) 충족률**을 보여줍니다 — 분모는 입력 필드 수가 아니라 W33 **원문 불릿 수**이며,
+검사 컨텍스트·판정·승인 기록으로 충족되는 불릿(검사일, 합격 기준, 검사 결과 …)도 셉니다(`models.w33_coverage`).
 
 | 구분 | 항목 (`InspectionContext.report` = `ReportDetails` 필드) |
 |---|---|
@@ -181,7 +203,39 @@ expander(기본 접힘)에서 입력합니다. 사이드바 캡션 **"📋 선�
   W33 원문 병기, 하나도 없으면 섹션 생략) · LLM 초안 payload의 **`[촬영 조건]`** 섹션(입력된 항목만 —
   검사원 실명은 여전히 제외, 자격 등급만 포함) · 아카이브 기록(`context.report`, 상세 보기 expander).
 - 항목 목록은 `models.REPORT_ITEMS` 한 곳에서 관리합니다(한국어 라벨·W33 원문·단위). `ReportDetails.coverage()`
-  가 `(입력 수, 25)` 를 돌려주며, 보고 항목이 없는 구버전 기록/백업 JSON도 그대로 로드됩니다(0/25).
+  는 입력 **필드** 수 `(입력 수, 25)` 를 돌려주고, UI·PDF·아카이브가 보여주는 충족률은
+  `models.w33_coverage(context, record=None, judged=…) → (충족 수, 25, 미충족 라벨)` 입니다.
+  보고 항목이 없는 구버전 기록/백업 JSON도 그대로 로드됩니다.
+- **충족 규칙** (`models.W33_ITEMS[*].rule_ko` 와 동일) — 원칙: 불릿의 하위 정보 중 워크벤치가 담을 수 있는
+  것이 **모두** 있을 때 충족, 컨텍스트/판정/승인 기록에 이미 있는 정보는 자동 충족, 조건부 항목은 보수적으로 처리.
+
+  | § | W33 불릿 | 충족 조건 |
+  |---|---|---|
+  | 8.2 | Date of testing | 항상(승인 시각 자동 기록) |
+  | 8.2 | Hull number, location and length of weld inspected | 선체 번호 + 위치(블록 또는 용접부 ID) + 검사 용접 길이 |
+  | 8.2 | Names, qualification level and signature of personnel | 판독원(성명) + 검사자 자격 등급 (서명은 출력물에 수기) |
+  | 8.2 | Identification of the component examined | 블록 |
+  | 8.2 | Identification of the welds examined | 용접부 ID |
+  | 8.2 | Steel grade, type of joint, thickness, welding process | 강재 등급 + 용접 방법 (이음 종류·두께는 컨텍스트 필수값) |
+  | 8.2 | Acceptance criteria | 항상(품질등급 + 적용 기준표 이름·버전) |
+  | 8.2 | Testing standards used | 검사 규격 (기법명 'RT (필름 스캔)'은 규격이 아니므로 제외) |
+  | 8.2 | Testing equipment and arrangement used | 검사 장비·배치 |
+  | 8.2 | Any test limitations, viewing conditions and temperature | 제한사항·관찰 조건·온도 |
+  | 8.2 | Results of testing … location and size of reportable indications | 판정 실행(verdict 표; 결함 없음도 결과) |
+  | 8.2 | Statement of acceptance / non-acceptance, evaluation date, evaluator | 판정 실행 + 판독원(성명) (평가일 자동) |
+  | 8.2 | Number of repairs if specific area repaired more than twice | 보수 횟수 ≥ 1 (0 = 해당 없음은 기본값과 구분 불가 → 미충족) |
+  | 8.5 | Type and size of radiation source, X-ray voltage | 선원 종류·크기 (관전압은 X선 장비에만 해당 → 필수 아님) |
+  | 8.5 | Type of film/designation and number of film per cassette | 필름 종류·카세트당 매수 |
+  | 8.5 | Number of radiographs (exposures) | 촬영 매수 |
+  | 8.5 | Type of intensifying screens | 증감지 종류 |
+  | 8.5 | Exposure technique, time of exposure and source-to-film distance | 촬영 기법 + 노출 시간 + SFD |
+  | 8.5 | Distance from radiation source to weld | 선원-용접부 거리 |
+  | 8.5 | Distance from source side of the weld to radiographic film | 용접부-필름 거리 |
+  | 8.5 | Angle of radiation beam through the weld | 빔 입사각 |
+  | 8.5 | Sensitivity, type and position of IQI | IQI 감도 + IQI 종류·위치 |
+  | 8.5 | Density | 농도 |
+  | 8.5 | Geometric un-sharpness | 기하학적 불선명도 |
+  | 8.5 | Specific acceptance class criteria for RT | RT 합격 등급 |
 - 수치 항목도 자유 서식 문자열로 저장합니다(보고서에 옮겨 적는 용도, 계산에 쓰지 않음).
 
 ## 주의 (데모 한계)
@@ -194,11 +248,13 @@ expander(기본 접힘)에서 입력합니다. 사이드바 캡션 **"📋 선�
   실 성능은 AI Hub 용접 AI(71761)·RIAWELC 학습 **YOLO26s**(Ultralytics YOLO, 2026.01 공개 — YOLOv8/11 가중치도
   같은 API) 가중치를 `weights/best.pt`에 두면
   자동으로 YOLO 백엔드로 전환됩니다 (`RTWB_YOLO_WEIGHTS` 환경변수로 경로 변경 가능).
+  YOLO26 가중치 로드에는 **`ultralytics>=8.4`** 가 필요합니다(`requirements.txt`의 주석 해제 후 설치;
+  구버전 ultralytics는 YOLO26 아키텍처를 인식하지 못합니다).
 - 합성 샘플 필름은 개발·시연용이며 실제 방사선 사진이 아닙니다.
 
 ## 참고 자료
 
-제안서의 참고 문헌과 같은 목록입니다(앱의 **📖 기준표·정보 → 참고 자료**와 동일하게 유지 — 테스트가 두 곳을 대조합니다).
+제안서 참고 문헌 중 규격·데이터셋·논문·도구 항목(뉴스·보도자료 제외)입니다(앱의 **📖 기준표·정보 → 참고 자료**와 동일하게 유지 — 테스트가 두 곳을 대조합니다).
 
 **규칙·규격**
 1. IACS UR W33 Rev.1/Corr.1 (2021) §3.3·§8·§9.2 — 선급 NDT 규칙 (§8: 보고서 필수 항목 25개)
